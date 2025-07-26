@@ -1,0 +1,7 @@
+#!/bin/bash
+
+# Make sure the bin folder exists
+mkdir -p $PREFIX/bin/
+
+# Copy utilities
+cp -ra bin/*  $PREFIX/bin/

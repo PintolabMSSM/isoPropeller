@@ -1,0 +1,34 @@
+{% set name                = "isoPropeller" %}
+{% set version             = "1.0" %}
+
+package:
+  name: "{{ name|lower }}"
+  version: "{{ version }}"
+
+source:
+  git_url: git@github.com:PintolabMSSM/{{ name }}.git
+
+build:
+  number: 1
+  noarch: generic
+
+requirements:
+  build:
+    - perl
+  run:
+    - perl
+    - perl-bio-perl
+    - perl-getopt-long
+    - perl-list-moreutils
+    - perl
+
+test:
+  commands:
+    # The test consists of running a few key scripts
+    - NIAP.pl -h
+
+about:
+  home: https://github.com/PintolabMSSM/{{ name }}/
+  license: Attribution-NonCommercial 4.0 International
+  license_family: CC
+  summary: Code for isoPropeller isoform analysis.

@@ -1,0 +1,171 @@
+#!/usr/bin/env perl
+#Author: ALin
+#Purpose: To generate statistics of the transcripts ends distributions based on NIAP's output file *_end_dist.txt.
+#Change log:
+#	v1.2	2022-08	Added SD and maximal difference in the output.
+#	v1.3	2023-08 Added the number of of TSSs/TTSs in the output.
+
+use strict;
+use Getopt::Long;
+
+my $version = "v1.3";
+
+my $usage = "Usage: perl NIAP_end_dist.pl
+	-i <String> Input
+	-o <String> Output
+	-h <Boolean> Help
+";
+
+my ($in, $out, $help) = ("", "", "");
+
+GetOptions(
+	'i=s'	=>	\$in,
+	'o=s'	=>	\$out,
+	'h!'	=>	\$help
+);
+
+if($help){
+	print "$usage";
+	exit;
+}
+
+unless($in && $out){
+        print "$usage";
+	exit;
+}
+
+parse_end_dist($in, $out);
+
+sub parse_end_dist{
+	my ($temp_in, $temp_out) = @_;
+	open(IN, $temp_in) or die "Cannot open $temp_in!\n";
+	open(OUT, "> $temp_out") or die "Cannot create $temp_out!\n";
+	my %temp_header = ();
+	my $temp_header = 0;
+
+	while(<IN>){
+		chomp;
+		my $temp_line = $_;
+		$temp_line =~ s/\r//;
+		my @temp_line = split('\t', $temp_line);
+		if($temp_header == 0){
+			my $temp_num_col = @temp_line;
+			for(my $i = 0; $i < $temp_num_col; $i++){
+				if(exists $temp_header{$temp_line[$i]}){
+					print STDERR "<ERROR> Duplicated column $temp_line[$i]!\n";
+					exit;
+				}
+				else{
+					$temp_header{$temp_line[$i]} = $i;
+				}
+			}
+			print OUT "chr\tstrand\tgene_id\ttranscript_id\tdepth\tends_entropy\tnum_tss\ttss_mass_center\ttss_entropy\ttss_sd\ttss_max_diff\tnum_tts\ttts_mass_center\ttts_entropy\ttts_sd\ttts_max_diff\n";
+			$temp_header = 1;
+			next;
+		}
+		print OUT "$temp_line[$temp_header{'chr'}]\t$temp_line[$temp_header{'strand'}]\t$temp_line[$temp_header{'gene_id'}]\t$temp_line[$temp_header{'transcript_id'}]\t$temp_line[$temp_header{'depth'}]\t";
+		my @temp_ends = split(',', $temp_line[$temp_header{'end_dist'}]);
+		my %temp_pos = ();
+		%{$temp_pos{'tss'}} = ();
+		%{$temp_pos{'tts'}} = ();
+		my %temp_entropy = ();
+		($temp_entropy{'ends'}, $temp_entropy{'tss'}, $temp_entropy{'tts'}) = (0, 0, 0);
+		my %temp_diff_sq = ();
+		($temp_diff_sq{'tss'}, $temp_diff_sq{'tts'}) = (0, 0);
+		my %temp_sd = ();
+		($temp_sd{'tss'}, $temp_sd{'tts'}) = (0, 0);
+		my %temp_mass_center = ();
+		($temp_mass_center{'tss'}, $temp_mass_center{'tts'}) = (0, 0);
+		my %temp_max_diff = ();
+		($temp_max_diff{'tss'}, $temp_max_diff{'tts'}) = (0, 0);
+		my $temp_total_depth;
+		if(exists $temp_header{'depth'}){
+			$temp_total_depth = $temp_line[$temp_header{'depth'}];
+		}
+		else{
+			if(exists $temp_header{'original_id'}){
+				$temp_total_depth = split(',', $temp_line[$temp_header{'original_id'}]);
+			}
+			else{
+				$temp_total_depth = 1;
+			}
+		}
+		foreach my $temp_ends (@temp_ends){
+			my ($temp_tss, $temp_tts, $temp_depth) = ("", "", "");
+			if($temp_ends =~ /(\d+)-(\d+):(\d+)/){
+				if($temp_line[$temp_header{'strand'}] eq "-"){
+					($temp_tts, $temp_tss, $temp_depth) = ($1, $2, $3);
+				}
+				else{
+					($temp_tss, $temp_tts, $temp_depth) = ($1, $2, $3);
+				}
+			}
+			else{
+				print STDERR "<ERROR> Incorrect ends distribution $temp_ends at\n$temp_line\n";
+				exit;
+			}
+			my $temp_prob = $temp_depth / $temp_total_depth;
+			$temp_entropy{'ends'} += (-($temp_prob * log($temp_prob)));
+			unless(exists $temp_pos{'tss'}{$temp_tss}){
+				$temp_pos{'tss'}{$temp_tss} = 0;
+			}
+			$temp_pos{'tss'}{$temp_tss} += $temp_depth;
+			unless(exists $temp_pos{'tts'}{$temp_tts}){
+				$temp_pos{'tts'}{$temp_tts} = 0;
+			}
+			$temp_pos{'tts'}{$temp_tts} += $temp_depth;
+		}
+		foreach my $temp_tss (keys %{$temp_pos{'tss'}}){
+			my $temp_prob = $temp_pos{'tss'}{$temp_tss} / $temp_total_depth;
+			$temp_entropy{'tss'} += (-($temp_prob * log($temp_prob)));
+			$temp_mass_center{'tss'} += ($temp_tss * $temp_prob);
+			foreach my $temp_tss_another (keys %{$temp_pos{'tss'}}){
+				if($temp_tss != $temp_tss_another){
+					if(abs($temp_tss - $temp_tss_another) > $temp_max_diff{'tss'}){
+						$temp_max_diff{'tss'} = abs($temp_tss - $temp_tss_another);
+					}
+				}
+			}
+		}
+		if($temp_total_depth > 1){
+			foreach my $temp_tss (keys %{$temp_pos{'tss'}}){
+				my $temp_prob = $temp_pos{'tss'}{$temp_tss} / ($temp_total_depth - 1);
+				$temp_diff_sq{'tss'} += (($temp_tss - $temp_mass_center{'tss'}) ** 2) * $temp_prob;
+			}
+			$temp_sd{'tss'} = sqrt($temp_diff_sq{'tss'});
+		}
+		else{
+			$temp_sd{'tss'} = 0;
+		}
+		foreach my $temp_tts (keys %{$temp_pos{'tts'}}){
+			my $temp_prob = $temp_pos{'tts'}{$temp_tts} / $temp_total_depth;
+			$temp_entropy{'tts'} += (-($temp_prob * log($temp_prob)));
+			$temp_mass_center{'tts'} += ($temp_tts * $temp_prob);
+			foreach my $temp_tts_another (keys %{$temp_pos{'tts'}}){
+				if($temp_tts != $temp_tts_another){
+					if(abs($temp_tts - $temp_tts_another) > $temp_max_diff{'tts'}){
+						$temp_max_diff{'tts'} = abs($temp_tts - $temp_tts_another);
+					}
+				}
+			}
+		}
+		if($temp_total_depth > 1){
+			foreach my $temp_tts (keys %{$temp_pos{'tts'}}){
+				my $temp_prob = $temp_pos{'tts'}{$temp_tts} / ($temp_total_depth - 1);
+				$temp_diff_sq{'tts'} += (($temp_tts - $temp_mass_center{'tts'}) ** 2) * $temp_prob;
+			}
+			$temp_sd{'tts'} = sqrt($temp_diff_sq{'tts'});
+		}
+		else{
+			$temp_sd{'tts'} = 0;
+		}
+		my $temp_num_tss = keys %{$temp_pos{'tss'}};
+		my $temp_num_tts = keys %{$temp_pos{'tts'}};
+		print OUT "$temp_entropy{'ends'}\t$temp_num_tss\t$temp_mass_center{'tss'}\t$temp_entropy{'tss'}\t$temp_sd{'tss'}\t$temp_max_diff{'tss'}\t$temp_num_tts\t$temp_mass_center{'tts'}\t$temp_entropy{'tts'}\t$temp_sd{'tts'}\t$temp_max_diff{'tts'}\n";
+	}
+	close IN;
+	close OUT;
+}
+
+
+

@@ -1,0 +1,1461 @@
+#!/usr/bin/env perl
+=start
+Author: ALin
+Purpose: To collapse RNA-seq long reads, perform splice junction correction based on the nearest splice junction provided by NGS or reference if available, and generate a .gtf file for all transcripts with unique structures.
+Change log:
+	v1.1	2021-02	This code is adopted from GLRA_v1.1.pl .Comparison between the 5'/3' ends of the read data and those in a referenc annotation is no longer supported. Instead, it is not possible to investigate the distribution of 5' and 3' end position for each transcript. Poly-A information from Nanopolish can be incorporated. It will also consider the coverage of the reference exon-exon junction if applicable.
+	v1.2	2021-04	The subroutine argument handling was modified. The find_nearest subroutine was imprvoed to speed up the process. The default value of -min_junc_dist was adjusted to 10.
+	v1.3	2022-02	Modified how the read depth and polyA were handled. Added extra steps to break and re-merge loci after exon-exon junction correction. Added the output of header to the .gtf file.
+	v1.4	2022-06	Paired the 5' and 3' end positions. Modified the structure of codes. Enables multithreading by splitting the chromosomes. Compatible with samtools >= 1.11. Revised the read filtering steps, that reads having not primary and supplementary alignment will be be filtered out.
+	v1.5	2022-08 Added the compatibility with X/= cigar. Output tempory files to a temporary folder.
+	v1.6	2022-09 Fixed a bug of exon having right position equal to or greater than left position by filtering out the read, which is likely mapping artifact. Fixed a bug in the statistics output.
+	v1.7	2023-02	Fixed a typo in the help menu. Added the option to specify the chromosomes to be included.
+	v1.8	2023-09	Restructured the code. Added the option to provide genome fasta file for filtering intrapriming and 5' support bed file for filtering monoexonic reads.
+	v1.8.2	2023-09	Use a hash for storing the 5' support data instead of tabix.
+	v1.8.3	2024-09	Fixed the bed file coordinate issue. Added an option to rescue predicted intrapriming reads ending in annotated exons.
+=cut
+
+use strict;
+use Getopt::Long;
+use List::Util qw(max min);
+use Bio::Seq;
+use Bio::SeqIO;
+use Benchmark qw(:hireswallclock);
+use threads;
+
+my $total_start_time = Benchmark->new;
+
+my $version = "v1.8.3";
+
+my ($bam, $out, $prefix, $mapq, $stp, $num_thread, $junc, $in_junc, $min_junc_dist, $junc_dist, $end_dist, $polya, $genome, $window, $frac_a_min, $length_a_min, $fprime, $fprime_dist, $ipr, $chr_list, $help) = ("", "", "NIAP", 0, "samtools", 1, "", 0, 10, 0, 0, "", "", 20, 0.6, 6, "", 100, "", "", 0);
+
+my $usage="Usage: perl NIAP.pl
+	-i <String> Input bam file (Required)
+	-o <String> Output base (Required)
+	-p <String> The prefix of gene and transcirpt IDs (Default: NIAP)
+	-q <Integer> Minimal mapping quality (Inclusive; default: $mapq)
+	-s <String> The path to samtools (samtools >= 1.11, default: \${PATH}/samtools)
+	-z <String> The path to tabix (Default: \${PATH}/tabix)
+	-t <Integer> The number of threads to use (Default: $num_thread)
+	-x <String> The gtf file specifying splice junctions used for correction. An optional attribute, depth, can be included.
+	-j <Boolean> The intervals of splice junctions specified by -x are introns. (Default: false for exons as input)
+	-m <Int> The minimal distance for splice junction correction (Default: $min_junc_dist, empirical)
+	-d <Boolean> Output the distance of splice junction between the prediction and the reference (Default: false)
+	-e <Boolean> Output the distribution of the 5' and 3' end position for each transcript (Default: false)
+	-a <String> The output from nanopolish polya
+	-g <String> The genome .fa file for intrapriming filtering
+	-w <Integer> The window size for intrapriming filtering (Default: $window)
+	-r <Float> Minimal fraction of \"A\"s to be considered as intrapriming (Default: $frac_a_min)
+	-v <Integer> The minial legnth of consecutive \"A\"s to be considered as inrapriming (Default: $length_a_min)
+	-f <String> The bed file of 5' support
+	-k <Integer> Minimal distance to 5' support (Default: $fprime_dist)
+	-l <String> The bed file of valid regions for intrapriming
+	-c <String> The list of chromosomes to be included
+	-h <Boolean> Help
+";
+
+GetOptions(
+	'i=s'	=>	\$bam,
+	'o=s'	=>	\$out,
+	'p=s'	=>	\$prefix,
+	'q=i'	=>	\$mapq,
+	's=s'	=>	\$stp,
+	't=i'	=>	\$num_thread,
+	'x=s'	=>	\$junc,
+	'j!'	=>	\$in_junc,
+	'm=i'	=>	\$min_junc_dist,
+	'd!'	=>	\$junc_dist,
+	'e!'	=>	\$end_dist,
+	'a=s'	=>	\$polya,
+	'g=s'	=>	\$genome,
+	'w=i'	=>	\$window,
+	'r=f'	=>	\$frac_a_min,
+	'v=i'	=>	\$length_a_min,
+	'f=s'	=>	\$fprime,
+	'k=i'	=>	\$fprime_dist,
+	'l=s'	=>	\$ipr,
+	'c=s'	=>	\$chr_list,
+        'h!'    =>      \$help
+);
+
+if($help){
+        print "$usage";
+        exit;
+}
+
+unless(`which $stp`){
+	print STDERR "<ERROR> Incorrect path for samtools!\n$usage";
+	exit;
+}
+`$stp --version` =~ /samtools [0-9]+\.([0-9]+)/;
+my $st_version = $1;
+if($st_version < 11){
+	print STDERR "<ERROR> Please use samtools 1.11 or a newer version.\n$usage";
+	exit;
+}
+
+unless($bam && $out){
+	print STDERR "$usage";
+	exit;
+}
+
+if($junc_dist){
+	unless($junc){
+		print STDERR "<ERROR> Must specify -junc with -junc_dist!\n$usage";
+		exit;
+	}
+}
+
+open(my $log_fh, "> ${out}.log") or die "<ERROR> Cannot create ${out}.log!\n";
+open(my $out_fh, "> ${out}.gtf") or die "<ERROR> Cannot create ${out}.gtf!\n";
+my $date_format = "+%F-%T.%3N";
+my $date = `date $date_format`;
+chomp $date;
+print $log_fh "[$date]\tperl NIAP_${version}.pl -i $bam -o $out -p $prefix -q $mapq -s $stp -t $num_thread";
+print $out_fh "#perl NIAP_${version}.pl -i $bam -p $prefix -o $out -q $mapq -s $stp -t $num_thread";
+if($junc){
+	if(-e $junc){
+		print $log_fh " -x $junc -m $min_junc_dist";
+		print $out_fh " -x $junc -m $min_junc_dist";
+	}
+	else{
+		print STDERR "$junc does not exists!\n$usage";
+		exit;
+	}
+}
+if($in_junc){
+	print $log_fh " -j";
+	print $out_fh " -j";
+}
+if($junc_dist){
+	print $log_fh " -d";
+	print $out_fh " -d";
+}
+if($end_dist){
+	print $log_fh " -e";
+	print $out_fh " -e";
+}
+if($polya){
+	if(-e $polya){
+		print $log_fh " -a $polya";
+		print $out_fh " -a $polya";
+	}
+	else{
+		print STDERR "$polya does not exist!\n$usage";
+		exit;
+	}
+}
+if($genome){
+	if(-e $genome){
+		print $log_fh " -g $genome -w $window -r $frac_a_min -v $length_a_min";
+		print $out_fh " -g $genome -w $window -r $frac_a_min -v $length_a_min";
+	}
+	else{
+		print STDERR "$genome does not exists!\n$usage";
+		exit;
+	}
+	if($ipr){
+		if(-e $ipr){
+			print $log_fh " -l $ipr";
+			print $out_fh " -l $ipr";
+		}
+		else{
+			print STDERR "$ipr does not exists!\n$usage";
+			exit;
+		}
+	}
+}
+else{
+	if($ipr){
+		print STDERR "<ERROR> Option -l requires -g!\n";
+		exit;
+	}
+}
+if($fprime){
+	if(-e $fprime){
+		print $log_fh " -f $fprime -k $fprime_dist";
+		print $out_fh " -f $fprime -k $fprime_dist";
+	}
+	else{
+		print STDERR "$fprime does not exists!\n$usage";
+		exit;
+	}
+}
+if($chr_list){
+	if(-e $chr_list){
+		print $log_fh " -c $chr_list";
+		print $out_fh " -c $chr_list";
+	}
+	else{
+		print STDERR "$chr_list does not exists!\n$usage";
+		exit;
+	}
+}
+print $log_fh "\n";
+print $out_fh "\n";
+close $out_fh;
+
+my $dir = "${out}__NIAP_temp";
+if(-d $dir){
+	print STDERR "<WARNNING> Temporary directory $dir exists! Will overwrite it...\n";
+	system("rm ${dir}/*");
+}
+elsif(-e $dir){
+	print STDERR "<ERROR> File $dir has the same name as the temporary directory! Please remove this file and re-run!\n";
+	exit;
+}
+else{
+	system("mkdir $dir");
+}
+
+my $total_thread = `grep -c \"^processor\" /proc/cpuinfo`;
+chomp $total_thread;
+$date = `date $date_format`;
+chomp $date;
+print $log_fh "[$date]\tA total of $total_thread threads detected\n";
+if($num_thread > $total_thread){
+	print STDERR "<WARNING> Exceeding the maximal total number of threads! Setting the number of thread to $total_thread...\n";
+	$num_thread = $total_thread;
+}
+
+$date = `date $date_format`;
+chomp $date;
+print $log_fh "[$date]\tPreprocessing files...\n";
+my $start_time = Benchmark->new;
+my ($chr_ref, $num_unmapped) = split_bam($dir, $bam, $stp, $chr_list);
+my $finish_time = Benchmark->new;
+my $time_spent = timediff($finish_time, $start_time);
+$date = `date $date_format`;
+chomp $date;
+print $log_fh "[$date]\tUsed ".timestr($time_spent)." to preprocess $bam.\n";
+if($junc){
+	$start_time = Benchmark->new;
+	split_ref_eej($chr_ref, $dir, $junc);
+	$finish_time = Benchmark->new;
+	$time_spent = timediff($finish_time, $start_time);
+	$date = `date $date_format`;
+	chomp $date;
+	print $log_fh "[$date]\tUsed ".timestr($time_spent)." to preprocess $junc.\n";
+}
+if($polya){
+	$start_time = Benchmark->new;
+	split_polya($chr_ref, $dir, $polya);
+	$finish_time = Benchmark->new;
+	$time_spent = timediff($finish_time, $start_time);
+	$date = `date $date_format`;
+	chomp $date;
+	print $log_fh "[$date]\tUsed ".timestr($time_spent)." to preprocess $polya.\n";
+}
+if($genome){
+	$start_time = Benchmark->new;
+	split_genome($chr_ref, $dir, $bam, $genome);
+	$finish_time = Benchmark->new;
+	$time_spent = timediff($finish_time, $start_time);
+	$date = `date $date_format`;
+	chomp $date;
+	print $log_fh "[$date]\tUsed ".timestr($time_spent)." to preprocess $genome.\n";
+}
+
+if($fprime){
+	$start_time = Benchmark->new;
+	split_region($chr_ref, $dir, $fprime, 'fprime', 'bed');
+	$finish_time = Benchmark->new;
+	$time_spent = timediff($finish_time, $start_time);
+	$date = `date $date_format`;
+	chomp $date;
+	print $log_fh "[$date]\tUsed ".timestr($time_spent)." to preprocess $fprime.\n";
+}
+if($ipr){
+	$start_time = Benchmark->new;
+	split_region($chr_ref, $dir, $ipr, 'ipr', 'bed');
+	$finish_time = Benchmark->new;
+	$time_spent = timediff($finish_time, $start_time);
+	$date = `date $date_format`;
+	chomp $date;
+	print $log_fh "[$date]\tUsed ".timestr($time_spent)." to preprocess $ipr.\n";
+}
+
+$date = `date $date_format`;
+chomp $date;
+print $log_fh "[$date]\tPreprocessing done!\n";
+
+my $chr_pos = 0;
+my @thread = ();
+my @running = ();
+
+while(@thread < @$chr_ref){
+	@running = threads->list(threads::running);
+	if(@running < $num_thread){
+		my $thread = threads->create(\&worker, $log_fh, $chr_ref->[$chr_pos], $dir, $mapq, $prefix, $min_junc_dist, $junc, $in_junc, $junc_dist, $end_dist, $polya, $genome, $window, $frac_a_min, $length_a_min, $fprime, $fprime_dist, $ipr, $stp);
+		push(@thread, $thread);
+		$chr_pos++;
+	}
+}
+
+my %read = ();
+
+foreach my $thread (@thread){
+	my $result_ref = $thread->join();
+	@{$read{$result_ref->[0]}} = ($result_ref->[1], $result_ref->[2]);
+	$date = `date $date_format`;
+	chomp $date;
+	print $log_fh "[$date]\tJoined for $result_ref->[0]!\n";
+}
+
+system("cat ${dir}/*_out.gtf |  sort -k 1,1 -k 4,4n >> ${out}.gtf");
+$date = `date $date_format`;
+chomp $date;
+print $log_fh "[$date]\tGenerated ${out}.gtf!\n";
+
+print_stat(\%read, $num_unmapped, "${out}_stat.txt");
+$date = `date $date_format`;
+chomp $date;
+print $log_fh "[$date]\tGenerated ${out}_stat.txt!\n";
+
+if($junc_dist){
+	system("echo \"chr\"\$\'\\t\'\"strand\"\$\'\\t\'\"query	nearest	distance\" > ${out}_junc_dist.txt");
+	system("cat ${dir}/*_junc_dist.txt >> ${out}_junc_dist.txt");
+	$date = `date $date_format`;
+	chomp $date;
+	print $log_fh "[$date]\tGenerated ${out}_junc_dist.txt!\n";
+}
+
+if($end_dist){
+	system("echo \"chr\"\$\'\\t\'\"strand\"\$\'\\t\'\"gene_id\"\$\'\\t\'\"transcript_id\"\$\'\\t\'\"depth\"\$\'\\t\'\"end_dist\" > ${out}_end_dist.txt");
+	system("cat ${dir}/*_end_dist.txt >> ${out}_end_dist.txt");
+	$date = `date $date_format`;
+	chomp $date;
+	print $log_fh "[$date]\tGenerated ${out}_end_dist.txt!\n";
+}
+
+system("rm -r $dir");
+$date = `date $date_format`;
+chomp $date;
+print $log_fh "[$date]\tRemoved temporary files!\n";
+
+my $total_finish_time = Benchmark->new;
+my $total_time_spent = timediff($total_finish_time, $total_start_time);
+$date = `date $date_format`;
+chomp $date;
+print $log_fh "[$date]\tTotal time used: ". timestr($total_time_spent) . "\n";
+
+sub worker{
+	my ($temp_log_fh, $temp_chr, $temp_dir, $temp_mapq, $temp_prefix, $temp_min_junc_dist, $temp_junc, $temp_in_junc, $temp_junc_dist, $temp_end_dist, $temp_polya, $temp_genome, $temp_window, $temp_frac_a_min, $temp_length_a_min, $temp_fprime, $temp_fprime_dist, $temp_ipr, $temp_stp) = @_;
+	my $temp_date_format = "+%F-%T.%3N";
+	my $temp_date = `date $temp_date_format`;
+	chomp $temp_date;
+	print $temp_log_fh "[$temp_date]\tStarting to process $temp_chr...\n";
+	my $temp_start_time = Benchmark->new;
+	my %temp_ref_eej_array= ();
+	my %temp_ref_eej_hash = ();
+	my %temp_polya = ();
+	my $temp_seq_in;
+	my $temp_seq_obj;
+	my %temp_tss = ();
+	my %temp_ip = ();
+	my $temp_num_filtered_junc_dist = 0;
+	my %temp_junc_dist;
+	my %temp_loci = ();
+	my %temp_read = ();
+
+	if($temp_junc){
+		read_ref_eej("${temp_dir}/${temp_chr}_eej.gtf", $temp_in_junc, \%temp_ref_eej_array, \%temp_ref_eej_hash);
+	}
+	if($temp_polya){
+		read_polya("${temp_dir}/${temp_chr}_polya.txt", \%temp_polya);
+	}
+	if($temp_genome){
+		$temp_seq_in = Bio::SeqIO->new(-file => "${temp_dir}/${temp_chr}.fa", -format => 'fasta');
+		$temp_seq_obj = $temp_seq_in->next_seq;
+
+	}
+	if($temp_fprime){
+		read_five_prime("${temp_dir}/${temp_chr}_fprime.bed", $temp_fprime_dist, \%temp_tss);
+	}
+	if($temp_ipr){
+		read_ip_rescue("${temp_dir}/${temp_chr}_ipr.bed", \%temp_ip);
+	}
+	foreach my $temp_type ('primary', 'kept', 'filtered', 'unmapped', 'low_quality', 'failed', 'duplicated', 'not_primary', 'supplementary', 'artifact', 'intrapriming', 'no_5p'){
+		%{$temp_read{$temp_type}} = ();
+	}
+
+	my $temp_fh;
+	open($temp_fh, "$temp_stp view ${temp_dir}/${temp_chr}.bam |") or die "<ERROR> Cannot open ${temp_dir}/${temp_chr}.bam!\n";
+
+	while(<$temp_fh>){
+		chomp;
+		my $temp_line = $_;
+		my @temp_line = split('\t', $temp_line);
+		#print "$temp_line\n";
+		#Filter the read
+		if(filter_bam_line(\%temp_read, \@temp_line, $temp_mapq, '')){
+			#print "Skipped $temp_line[0]\n";
+			next;
+		}
+		#Parse the read structure
+		my ($temp_strand, $temp_leftmost, $temp_rightmost, $temp_eej, $temp_ends_ref, $temp_polya_flag_ref) = parse_bam_line($temp_chr, \@temp_line, \%temp_polya, \%temp_ref_eej_hash, $temp_seq_obj, \%temp_tss, \%temp_ip, $temp_window, $temp_frac_a_min, $temp_length_a_min, $temp_fprime);
+		if(($temp_strand eq 'artifact') || ($temp_strand eq 'intrapriming') || ($temp_strand eq 'no_5p')){
+			filter_bam_line(\%temp_read, \@temp_line, $temp_mapq, $temp_strand);
+			next;
+		}
+		my $temp_depth = 1;
+		add_locus(\%temp_loci, $temp_strand, $temp_leftmost, $temp_rightmost, $temp_eej, $temp_depth, $temp_ends_ref, $temp_polya_flag_ref);
+		#print "Added $temp_line[0]\n";
+	}
+	close $temp_fh;
+	$temp_date = `date $temp_date_format`;
+	chomp $temp_date;
+	print $temp_log_fh "[$temp_date]\tProcessed bam file for $temp_chr!\n";
+
+	merge_loci(\%temp_loci);
+	$temp_date = `date $temp_date_format`;
+	chomp $temp_date;
+	print $temp_log_fh "[$temp_date]\tMerged loci for $temp_chr!\n";
+
+	if($temp_junc){
+		($temp_num_filtered_junc_dist) = correct_eej(\%temp_loci, \%temp_ref_eej_array, \%temp_ref_eej_hash, $temp_min_junc_dist, \%temp_junc_dist);
+		break_loci(\%temp_loci);
+		merge_loci(\%temp_loci);
+	}
+
+	print_gtf($temp_chr, $temp_dir, \%temp_loci, $temp_prefix, $temp_end_dist);
+
+	if($temp_junc_dist){
+		print_junc_dist($temp_chr, $temp_dir, \%temp_junc_dist);
+	}
+
+	foreach my $temp_type (keys %temp_read){
+		my $temp_num = keys %{$temp_read{$temp_type}};
+		#print "$temp_chr\t$temp_type\t$temp_num\n";
+	}
+	#print "Correction failed: $temp_num_filtered_junc_dist\n";
+	#print "Returning %temp_read $temp_chr $temp_num_filtered_junc_dist\n";
+
+	my @temp_result = ($temp_chr, \%temp_read, $temp_num_filtered_junc_dist);
+
+	my $temp_finish_time = Benchmark->new;
+	my $temp_time_spent = timediff($temp_finish_time, $temp_start_time);
+	$temp_date = `date $date_format`;
+	chomp $temp_date;
+	print $temp_log_fh "[$temp_date]\tDone for $temp_chr in  " . timestr($temp_time_spent) . "!\n";
+
+	return \@temp_result;
+}
+
+#Split the bam records of different chromosomes into different bam files.
+sub split_bam{
+	my ($temp_dir, $temp_bam, $temp_stp, $temp_chr_list) = @_;
+	my $temp_fh;
+	if($temp_chr_list ne ""){
+		open($temp_fh, $temp_chr_list) or die "<ERROR> Cannot open $temp_chr_list!\n";
+	}
+	else{
+		open($temp_fh, "$temp_stp view -H $temp_bam | grep \"^\@SQ\" | cut -d':' -f2 | cut -f1 | sort | uniq |") or die "<ERROR> Cannot open $temp_bam!\n";
+	}
+	my @temp_chr = ();
+	my $temp_count = 0;
+	my %temp_chr = ();
+	my @temp_fh = ();
+	my $temp_num_unmapped = `$temp_stp view -c -f 4 $temp_bam`;
+	chomp($temp_num_unmapped);
+	while(<$temp_fh>){
+		chomp;
+		my $temp_chr = $_;
+		$temp_chr =~ s/\r//;
+		unless(exists $temp_chr{$temp_chr}){
+			$temp_chr{$temp_chr} = $temp_count;
+			open($temp_fh[$temp_count], "| $temp_stp view -bS - > ${temp_dir}/${temp_chr}.bam")
+		}
+		$temp_count++;
+		push(@temp_chr, $temp_chr);
+	}
+	close $temp_fh;
+	open($temp_fh, "$temp_stp view -h $temp_bam |") or die "<ERROR> Cannot open $temp_bam!\n";
+	while(<$temp_fh>){
+		my $temp_line = $_;
+		if($temp_line =~ /^@/){
+			foreach my $temp_chr_fh (@temp_fh){
+				print $temp_chr_fh "$temp_line";
+			}
+		}
+		else{
+			my @temp_line = split('\t', $temp_line);
+			if(exists $temp_chr{$temp_line[2]}){
+				print {$temp_fh[$temp_chr{$temp_line[2]}]} "$temp_line";
+			}
+		}
+	}
+	close $temp_fh;
+
+	return (\@temp_chr, $temp_num_unmapped);
+}
+
+#Split the reference eejs of different chromosomes into different files.
+sub split_ref_eej{
+	my ($temp_chr_ref, $temp_dir, $temp_junc) = @_;
+	foreach my $temp_chr (@$temp_chr_ref){
+		system("grep \"^$temp_chr\"\$\'\\t\' $temp_junc > ${temp_dir}/${temp_chr}_eej.gtf");
+	}
+
+	return 1;
+}
+
+#Split the poly-A result from nanopolish polya of different chromosomes into different files.
+sub split_polya{
+	my ($temp_chr_ref, $temp_dir, $temp_polya) = @_;
+	foreach my $temp_chr (@$temp_chr_ref){
+		system("head -1 $temp_polya > ${temp_dir}/${temp_chr}_polya.txt");
+		system("grep \$\'\\t\'\"$temp_chr\"\$\'\\t\' $temp_polya >> ${temp_dir}/${temp_chr}_polya.txt");
+	}
+
+	return 1;
+}
+
+sub split_genome{
+	my ($temp_chr_ref, $temp_dir, $temp_bam, $temp_genome) = @_;
+	my %temp_chr = ();
+	foreach my $temp_chr (@$temp_chr_ref){
+		unless(exists $temp_chr{$temp_chr}){
+			$temp_chr{$temp_chr} = 1;
+		}
+	}
+	my $temp_chr_count = 0;
+	my $temp_seq_in = Bio::SeqIO->new(-file => $temp_genome, -format => 'fasta');
+	while(my $temp_seq_obj = $temp_seq_in->next_seq){
+		my $temp_chr = $temp_seq_obj->primary_id;
+		if(exists $temp_chr{$temp_chr}){
+			my $temp_seq_out = Bio::SeqIO->new(-file => "> ${temp_dir}/${temp_chr}.fa", -format => 'fasta');
+			$temp_seq_out->write_seq($temp_seq_obj);
+			$temp_chr_count++;
+		}
+	}
+	my $temp_chr_ref_count = keys @$temp_chr_ref;
+	if($temp_chr_ref_count != $temp_chr_count){
+		print STDERR "<ERROR> Sequences in $temp_genome not matching $temp_bam!\n";
+		exit;
+	}
+
+	return 1;
+}
+
+#Split the region file, including bed and gtf, of different chromosomes into different files.
+sub split_region{
+	my ($temp_chr_ref, $temp_dir, $temp_bed, $temp_type, $temp_format) = @_;
+	my %temp_type = (fprime => 1, ipr => 1);
+	my %temp_format = (bed => 1);
+	unless(exists $temp_type{$temp_type}){
+		print STDERR "<ERROR> Incorrect type in split_region!\n";
+		exit;
+	}
+	unless(exists $temp_format{$temp_format}){
+		print STDERR "<ERROR> Unsupported format in split_region!\n";
+	}
+	foreach my $temp_chr (@$temp_chr_ref){
+		system("grep \"^$temp_chr\"\$\'\\t\' $temp_bed > ${temp_dir}/${temp_chr}_${temp_type}.${temp_format}");
+	}
+
+	return 1;
+}
+
+sub print_stat{
+	my ($temp_read_ref, $temp_num_unmapped, $temp_out) = @_;
+	my $temp_fh;
+	open($temp_fh, "> $temp_out") or die "<ERROR> Cannot create $temp_out!\n";
+	my %temp_all_read = ();
+	my $temp_uncorrected = 0;
+	print $temp_fh "chr";
+	foreach my $temp_type ('primary', 'kept', 'filtered', 'unmapped', 'low_quality', 'failed', 'duplicated', 'secondary', 'supplementary', 'artifact', 'intrapriming', 'no_5p', 'uncorrected'){
+		%{$temp_all_read{$temp_type}} = ();
+		print $temp_fh "\t$temp_type";
+	}
+	print $temp_fh "\n";
+
+	foreach my $temp_chr (sort {$a cmp $b} keys %$temp_read_ref){
+		print $temp_fh "$temp_chr";
+		my $temp_primary = keys %{$temp_read_ref->{$temp_chr}[0]{'primary'}};
+		print $temp_fh "\t$temp_primary";
+		foreach my $temp_read (keys %{$temp_read_ref->{$temp_chr}[0]{'primary'}}){
+			unless(exists $temp_all_read{'primary'}{$temp_read}){
+				$temp_all_read{'primary'}{$temp_read} = 1;
+			}
+		}
+		my $temp_kept = keys %{$temp_read_ref->{$temp_chr}[0]{'kept'}};
+		$temp_kept -= $temp_read_ref->{$temp_chr}[1];
+		print $temp_fh "\t$temp_kept";
+		foreach my $temp_read (keys %{$temp_read_ref->{$temp_chr}[0]{'kept'}}){
+			unless(exists $temp_all_read{'kept'}{$temp_read}){
+				$temp_all_read{'kept'}{$temp_read} = 1;
+			}
+		}
+		my $temp_filtered = keys %{$temp_read_ref->{$temp_chr}[0]{'filtered'}};
+		$temp_filtered += $temp_read_ref->{$temp_chr}[1];
+		print $temp_fh "\t$temp_filtered";
+		foreach my $temp_read (keys %{$temp_read_ref->{$temp_chr}[0]{'filtered'}}){
+			unless(exists $temp_all_read{'filtered'}{$temp_read}){
+				$temp_all_read{'filtered'}{$temp_read} = 1;
+			}
+		}
+		foreach my $temp_type ('unmapped', 'low_quality', 'failed', 'duplicated', 'secondary', 'supplementary', 'artifact', 'intrapriming', 'no_5p'){
+			my $temp_count = keys %{$temp_read_ref->{$temp_chr}[0]{$temp_type}};
+			print $temp_fh "\t$temp_count";
+			foreach my $temp_read (keys %{$temp_read_ref->{$temp_chr}[0]{$temp_type}}){
+				unless(exists $temp_all_read{$temp_type}{$temp_read}){
+					$temp_all_read{$temp_type}{$temp_read} = 1;
+				}
+			}
+		}
+		$temp_uncorrected += $temp_read_ref->{$temp_chr}[1];
+		print $temp_fh "\t$temp_read_ref->{$temp_chr}->[1]\n";
+	}
+
+	print $temp_fh "Total";
+	foreach my $temp_type ('primary', 'kept', 'filtered', 'unmapped', 'low_quality', 'failed', 'duplicated', 'secondary', 'supplementary', 'artifact', 'intrapriming', 'no_5p'){
+		my $temp_count = keys %{$temp_all_read{$temp_type}};
+		if($temp_type eq 'kept'){
+			$temp_count -= $temp_uncorrected;
+		}
+		elsif($temp_type eq 'filtered'){
+			$temp_count += $temp_uncorrected;
+		}
+		elsif($temp_type eq 'unmapped'){
+			$temp_count += $temp_num_unmapped;
+		}
+		print $temp_fh "\t$temp_count";
+	}
+	print $temp_fh "\t$temp_uncorrected\n";
+	close $temp_fh;
+
+	return 1;
+}
+
+#Read the splice junction gtf file if provided.
+sub read_ref_eej{
+	my ($temp_junc, $temp_in_junc, $temp_ref_eej_array_ref, $temp_ref_eej_hash_ref) = @_;
+	open(my $temp_fh, $temp_junc) or die "<ERROR> Cannot open $temp_junc!\n";
+	while(<$temp_fh>){
+		chomp;
+		my $temp_line = $_;
+		$temp_line =~ s/\r//;
+		my @temp_line = split('\t', $temp_line);
+		unless(exists $temp_ref_eej_array_ref->{$temp_line[6]}){
+			@{$temp_ref_eej_array_ref->{$temp_line[6]}} = ();
+			%{$temp_ref_eej_hash_ref->{$temp_line[6]}} = ();
+		}
+		my $temp_depth = 0;
+		if($temp_line[8] =~ /depth \"(\d+)\"\;/){
+			$temp_depth = $1;
+		}
+		if($temp_in_junc){
+			$temp_line[3] -= 1;
+			$temp_line[4] += 1;
+		}
+		my @temp_ref_eej = ($temp_line[3], $temp_line[4], $temp_depth);
+		#print "$temp_line[0]\t$temp_line[6]\t$temp_line[3]\t$temp_line[4]\t$temp_depth\n";
+		push(@{$temp_ref_eej_array_ref->{$temp_line[6]}}, \@temp_ref_eej);
+		unless(exists $temp_ref_eej_hash_ref->{$temp_line[6]}{$temp_line[3]}){
+			%{$temp_ref_eej_hash_ref->{$temp_line[6]}{$temp_line[3]}} = ();
+		}
+		unless(exists $temp_ref_eej_hash_ref->{$temp_line[6]}{$temp_line[3]}{$temp_line[4]}){
+			$temp_ref_eej_hash_ref->{$temp_line[6]}{$temp_line[3]}{$temp_line[4]} = $temp_depth;
+		}
+	}
+
+	return 1;
+}
+
+#Read the poly-A result from nanopolish polya
+sub read_polya{
+	my ($temp_polya, $temp_polya_ref) = @_;
+	open(my $temp_fh, $temp_polya) or die "<ERROR> Cannot open $temp_polya!\n";
+	my $temp_header = 0;
+	my %temp_header = ();
+	while(<$temp_fh>){
+		chomp;
+		my $temp_line = $_;
+		$temp_line =~ s/\r//;
+		my @temp_line = split('\t', $temp_line);
+		if($temp_header == 0){
+			my $temp_num_col = @temp_line;
+			for(my $i = 0; $i < $temp_num_col; $i++){
+				unless(exists $temp_header{$temp_line[$i]}){
+					$temp_header{$temp_line[$i]} = $i;
+				}
+			}
+			$temp_header = 1;
+			next;
+		}
+		unless(exists $temp_polya_ref->{$temp_line[$temp_header{'readname'}]}){
+			$temp_polya_ref->{$temp_line[$temp_header{'readname'}]} = $temp_line[$temp_header{'qc_tag'}];
+		}
+	}
+	close $temp_fh;
+
+	return 1;
+}
+
+#Read the 5' support bed file
+sub read_five_prime{
+	my ($temp_fprime, $temp_fprime_dist, $temp_tss_ref) = @_;
+	open(my $temp_fh, $temp_fprime) or die "Cannot open $temp_fprime!\n";
+	while(<$temp_fh>){
+		chomp;
+		my $temp_line = $_;
+		$temp_line =~ s/\r//;
+		my @temp_line = split('\t', $temp_line);
+		unless(exists $temp_tss_ref->{$temp_line[5]}){
+			%{$temp_tss_ref->{$temp_line[5]}} = ();
+		}
+		my ($temp_left, $temp_right) = ($temp_line[1] + 1 - $temp_fprime_dist, $temp_line[2] + $temp_fprime_dist);
+		for(my $temp_pos = $temp_left; $temp_pos <= $temp_right; $temp_pos++){
+			unless(exists $temp_tss_ref->{$temp_line[5]}{$temp_pos}){
+				$temp_tss_ref->{$temp_line[5]}{$temp_pos} = 1;
+			}
+		}
+	}
+	close $temp_fh;
+
+	return 1;
+}
+
+#Read the intrapriming rescue bed file
+sub read_ip_rescue{
+	my ($temp_ipr, $temp_ip_ref) = @_;
+	open(my $temp_fh, $temp_ipr) or die "Cannot open $temp_ipr!\n";
+	while(<$temp_fh>){
+		chomp;
+		my $temp_line = $_;
+		$temp_line =~ s/\r//;
+		my @temp_line = split('\t', $temp_line);
+		unless(exists $temp_ip_ref->{$temp_line[5]}){
+			%{$temp_ip_ref->{$temp_line[5]}} = ();
+		}
+		my ($temp_left, $temp_right) = ($temp_line[1] + 1, $temp_line[2]);
+		for(my $temp_pos = $temp_left; $temp_pos <= $temp_right; $temp_pos++){
+			unless(exists $temp_ip_ref->{$temp_line[5]}{$temp_pos}){
+				$temp_ip_ref->{$temp_line[5]}{$temp_pos} = 0;
+			}
+		}
+	}
+	close $temp_fh;
+
+	return 1;
+}
+
+#Check whether a single line of the bam file need to be filtered or not.
+sub filter_bam_line{
+	my ($temp_read_ref, $temp_line_ref, $temp_mapq, $temp_label) = @_;
+	my $temp_primary_flag = 1;
+	my $temp_skip_flag = 0;
+
+	if($temp_label eq ''){
+		if($temp_line_ref->[1] & 0x4){
+			#Unmapped read
+			unless(exists $temp_read_ref->{'unmapped'}{$temp_line_ref->[0]}){
+				$temp_read_ref->{'unmapped'}{$temp_line_ref->[0]} = 1;
+			}
+			$temp_primary_flag = 0;
+			$temp_skip_flag = 1;
+		}
+		if($temp_line_ref->[1] & 0x100){
+			#Secondary alignment
+			unless(exists $temp_read_ref->{'secondary'}{$temp_line_ref->[0]}){
+				$temp_read_ref->{'secondary'}{$temp_line_ref->[0]} = 1;
+			}
+			$temp_primary_flag = 0;
+			$temp_skip_flag = 1;
+		}
+		if($temp_line_ref->[1] & 0x200){
+			#Failed read
+			unless(exists $temp_read_ref->{'failed'}{$temp_line_ref->[0]}){
+				$temp_read_ref->{'failed'}{$temp_line_ref->[0]} = 1;
+			}
+			$temp_primary_flag = 0;
+			$temp_skip_flag = 1;
+		}
+		if($temp_line_ref->[1] & 0x400){
+			#PCR or optical duplicate
+			unless(exists $temp_read_ref->{'duplicated'}{$temp_line_ref->[0]}){
+				$temp_read_ref->{'duplicated'}{$temp_line_ref->[0]} = 1;
+			}
+			$temp_primary_flag = 0;
+			$temp_skip_flag = 1;
+	       	 }
+		if($temp_line_ref->[1] & 0x800){
+			#Supplementary alignment
+			unless(exists $temp_read_ref->{'supplementary'}{$temp_line_ref->[0]}){
+				$temp_read_ref->{'supplementary'}{$temp_line_ref->[0]} = 1;
+			}
+			$temp_primary_flag = 0;
+			$temp_skip_flag = 1;
+		}
+	}
+	if($temp_primary_flag == 1){
+		unless(exists $temp_read_ref->{'primary'}{$temp_line_ref->[0]}){
+			$temp_read_ref->{'primary'}{$temp_line_ref->[0]} = 1;
+		}
+		if($temp_line_ref->[4] < $temp_mapq){
+			#Score filtering
+			unless(exists $temp_read_ref->{'low_quality'}{$temp_line_ref->[0]}){
+				$temp_read_ref->{'low_quality'}{$temp_line_ref->[0]} = 1;
+			}
+			$temp_skip_flag = 1;
+		}
+		if($temp_label eq 'artifact'){
+			#Splicing artifact
+			unless(exists $temp_read_ref->{'artifact'}{$temp_line_ref->[0]}){
+				$temp_read_ref->{'artifact'}{$temp_line_ref->[0]} = 1;
+			}
+			$temp_skip_flag = 1;
+		}
+		elsif($temp_label eq 'intrapriming'){
+			#Likely intrapriming
+			unless(exists $temp_read_ref->{'intrapriming'}{$temp_line_ref->[0]}){
+				$temp_read_ref->{'intrapriming'}{$temp_line_ref->[0]} = 1;
+			}
+			$temp_skip_flag = 1;
+		}
+		elsif($temp_label eq 'no_5p'){
+			#Monoexonic read without 5' support
+			unless(exists $temp_read_ref->{'no_5p'}{$temp_line_ref->[0]}){
+				$temp_read_ref->{'no_5p'}{$temp_line_ref->[0]} = 1;
+			}
+			$temp_skip_flag = 1;
+		}
+		if($temp_skip_flag == 1){
+			unless(exists $temp_read_ref->{'filtered'}{$temp_line_ref->[0]}){
+				$temp_read_ref->{'filtered'}{$temp_line_ref->[0]} = 1;
+			}
+			if(exists $temp_read_ref->{'kept'}{$temp_line_ref->[0]}){
+				delete $temp_read_ref->{'kept'}{$temp_line_ref->[0]};
+			}
+		}
+		else{
+			unless(exists $temp_read_ref->{'kept'}{$temp_line_ref->[0]}){
+				$temp_read_ref->{'kept'}{$temp_line_ref->[0]} = 1;
+			}
+		}
+	}
+
+	return $temp_skip_flag;
+}
+
+#Count the numbers of total and longest consecutive A/Ts
+sub count_a_t{
+	my ($temp_seq, $temp_a_t) = @_;
+	my ($temp_count, $temp_cur_count, $temp_longest_count) = (0, 0, 0);
+	my @temp_seq = split('', $temp_seq);
+	foreach my $temp_nt (@temp_seq){
+		if($temp_nt eq $temp_a_t){
+			$temp_count++;
+			$temp_cur_count++;
+		}
+		else{
+			if($temp_longest_count < $temp_cur_count){
+				$temp_longest_count = $temp_cur_count;
+			}
+			$temp_cur_count = 0;
+		}
+	}
+	if($temp_longest_count < $temp_cur_count){
+		$temp_longest_count = $temp_cur_count;
+	}
+
+	return ($temp_count, $temp_longest_count);
+}
+
+#Intrapriming filter
+sub intrapriming{
+	my ($temp_seq_obj, $temp_ip_ref, $temp_strand, $temp_left, $temp_right, $temp_window, $temp_frac_a_min, $temp_length_a_min) = @_;
+	if($temp_seq_obj){
+		unless(exists $temp_ip_ref->{$temp_strand}){
+			%{$temp_ip_ref->{$temp_strand}} = ();
+		}
+		my ($temp_tts, $temp_frac_a, $temp_longest_a);
+		if($temp_strand eq '-'){
+			$temp_tts = $temp_left;
+			if(exists $temp_ip_ref->{$temp_strand}{$temp_tts}){
+
+				return $temp_ip_ref->{$temp_strand}{$temp_tts};
+			}
+			$temp_right = $temp_left - 1;
+			$temp_left -= $temp_window;
+			if(($temp_right < 1) || ($temp_left < 1)){
+				($temp_frac_a, $temp_longest_a) = (0, 0);
+			}
+			else{	
+				my $temp_seq = $temp_seq_obj->subseq($temp_left, $temp_right);
+				($temp_frac_a, $temp_longest_a) = count_a_t($temp_seq, 'T');
+			}
+			$temp_frac_a /= $temp_window;
+		}
+		else{
+			$temp_tts = $temp_right;
+			if(exists $temp_ip_ref->{$temp_strand}{$temp_tts}){
+
+				return $temp_ip_ref->{$temp_strand}{$temp_tts};
+			}
+			$temp_left = $temp_right + 1;
+			$temp_right += $temp_window;
+			if(($temp_left > $temp_seq_obj->length()) || ($temp_right > $temp_seq_obj->length())){
+				($temp_frac_a, $temp_longest_a) = (0, 0);
+			}
+			else{
+				my $temp_seq = $temp_seq_obj->subseq($temp_left, $temp_right);
+				($temp_frac_a, $temp_longest_a) = count_a_t($temp_seq, 'A');
+			}
+			$temp_frac_a /= $temp_window;
+		}
+		#print "$temp_frac_a\t$temp_longest_a\n";
+		if(($temp_frac_a >= $temp_frac_a_min) && ($temp_longest_a >= $temp_length_a_min)){
+			$temp_ip_ref->{$temp_strand}{$temp_tts} = 1;
+
+			return $temp_ip_ref->{$temp_strand}{$temp_tts};
+		}
+		else{
+			$temp_ip_ref->{$temp_strand}{$temp_tts} = 0;
+
+			return $temp_ip_ref->{$temp_strand}{$temp_tts};
+		}
+	}
+
+	return 0;
+}
+
+#Check for 5' support
+sub five_prime_support{
+	my ($temp_tss_ref, $temp_strand, $temp_left, $temp_right, $temp_fprime) = @_;
+	#print "$temp_chr\t$temp_strand\t$temp_left\t$temp_right\n";
+	if($temp_fprime){
+		my $temp_tss;
+		if($temp_strand eq '-'){
+			$temp_tss = $temp_right;
+		}
+		else{
+			$temp_tss = $temp_left;
+		}
+		#print "TSS: $temp_tss\n";
+		if(exists $temp_tss_ref->{$temp_strand}{$temp_tss}){
+
+			return 1;
+		}
+		else{
+
+			return 0;
+		}
+
+	}
+
+	return 1;
+}
+
+#Parse a single line of the bam file and return the strand, leftmost position, rightmost position and exon-exon junction string (for multi-exon transcript only).
+sub parse_bam_line{
+	my ($temp_chr, $temp_line_ref, $temp_polya_ref, $temp_ref_eej_hash_ref, $temp_seq_obj, $temp_tss_ref, $temp_ip_ref, $temp_window, $temp_frac_a_min, $temp_length_a_min, $temp_fprime) = @_;
+	my $temp_cigar = $temp_line_ref->[5];
+	#print "$temp_cigar\n";
+	my $temp_strand;
+	if($temp_line_ref->[1] & 0x10){
+		$temp_strand = "-";
+	}
+	else{
+		$temp_strand = "+";
+	}
+	my $temp_eej = "";
+        my $temp_leftmost = $temp_line_ref->[3];
+	my $temp_rightmost = $temp_line_ref->[3] - 1;
+	my $temp_cur_exon_left = $temp_line_ref->[3];
+	my %temp_ends = ();
+	my %temp_polya_flag = ();
+
+	if(exists $temp_polya_ref->{$temp_line_ref->[0]}){
+		unless(exists $temp_polya_flag{$temp_polya_ref->{$temp_line_ref->[0]}}){
+			$temp_polya_flag{$temp_polya_ref->{$temp_line_ref->[0]}} = 1;
+		}
+	}
+
+	my $temp_cigar_length = length($temp_cigar);
+	while($temp_cigar_length > 0){
+		my $temp_length;
+		my $temp_status;
+		if($temp_cigar =~ /^(\d+)(\D)/){
+			$temp_length = $1;
+			$temp_status = $2;
+		}
+		else{
+			print STDERR "Invalid CIGAR in the follow line\n@{$temp_line_ref}\n";
+			exit;
+		}
+		if($temp_status eq "N"){
+			if($temp_cur_exon_left > $temp_rightmost){
+
+				return 'artifact';
+			}
+			my $temp_exon_left = $temp_rightmost + $temp_length + 1;
+			$temp_cur_exon_left = $temp_exon_left;
+			$temp_eej .= "-${temp_rightmost},${temp_exon_left}";
+			$temp_rightmost += $temp_length;
+		}
+		elsif($temp_status eq "D"){
+			my $temp_exon_left = $temp_rightmost + $temp_length + 1;
+			if(exists $temp_ref_eej_hash_ref->{$temp_strand}{$temp_rightmost}{$temp_exon_left}){
+				if($temp_cur_exon_left > $temp_rightmost){
+
+					return 'artifact';
+				}
+				$temp_cur_exon_left = $temp_exon_left;
+				$temp_eej .= "-${temp_rightmost},${temp_exon_left}";
+			}
+			else{
+				$temp_rightmost += $temp_length;
+			}
+		}
+		elsif(($temp_status eq "M") || ($temp_status eq "=") || ($temp_status eq "X")){
+			$temp_rightmost += $temp_length;
+		}
+		else{
+			if(($temp_status ne "S") && ($temp_status ne "H") && ($temp_status ne "I")){
+				print STDERR "Unrecognized CIGAR flag, $temp_status, in line\n@{$temp_line_ref}\n";
+				exit;
+			}
+		}
+		#print "$temp_length\t$temp_status\t$temp_eej\n";
+		$temp_cigar =~ s/^\d+\D//;
+		$temp_cigar_length = length($temp_cigar);
+	}
+	if($temp_cur_exon_left > $temp_rightmost){
+
+		return 'artifact';
+	}
+	if(intrapriming($temp_seq_obj, $temp_ip_ref, $temp_strand, $temp_leftmost, $temp_rightmost, $temp_window, $temp_frac_a_min, $temp_length_a_min)){
+		#print "intrapriming\n";
+
+		return 'intrapriming';
+	}
+	$temp_eej .= "-";
+	if($temp_eej eq '-'){
+		#print "monoexonic\n";
+		unless(five_prime_support($temp_tss_ref, $temp_strand, $temp_leftmost, $temp_rightmost, $temp_fprime)){
+			#print "no_5p\n";
+
+			return 'no_5p';
+		}
+	}
+	unless(exists $temp_ends{"$temp_leftmost-$temp_rightmost"}){
+		$temp_ends{"$temp_leftmost-$temp_rightmost"} = 0;
+	}
+	$temp_ends{"$temp_leftmost-$temp_rightmost"}++;
+	#print "$temp_line_ref->[0]\t$temp_strand\t$temp_leftmost\t$temp_rightmost\t$temp_eej\n";
+
+	return ($temp_strand, $temp_leftmost, $temp_rightmost, $temp_eej, \%temp_ends, \%temp_polya_flag);
+}
+
+#Add a loci to the loci hash as in the first argument
+sub add_locus{
+	my ($temp_loci_ref, $temp_strand, $temp_leftmost, $temp_rightmost, $temp_eej, $temp_depth, $temp_ends_ref, $temp_polya_flag_ref) = @_;
+	#Initiate the strand tab for the loci hash
+	unless(exists $temp_loci_ref->{$temp_strand}){
+		@{$temp_loci_ref->{$temp_strand}} = ();
+	}
+	my %temp_transcript = ();
+	unless(exists $temp_transcript{$temp_eej}){
+		@{$temp_transcript{$temp_eej}} = ();
+	}
+	my @temp_transcript = ($temp_leftmost, $temp_rightmost, $temp_depth, $temp_ends_ref, $temp_polya_flag_ref);
+	#print "@temp_transcript\n";
+	push(@{$temp_transcript{$temp_eej}}, \@temp_transcript);
+	my @temp_locus = ($temp_leftmost, $temp_rightmost, \%temp_transcript);
+	push(@{$temp_loci_ref->{$temp_strand}}, \@temp_locus);
+	#print "$temp_strand\t@temp_locus\n";
+	#foreach my $i (keys %{$temp_locus[2]}){
+		#print "$i\t$temp_locus[2]{$i}\n";
+	#}
+
+	return 1;
+}
+
+#Merge locus in the loci hash as in the first argument
+sub merge_loci{
+	my ($temp_loci_ref) = @_;
+	foreach my $temp_strand (keys %$temp_loci_ref){
+		#print "$current_chr\t$temp_strand\n@{$loci_ref->{$temp_strand}}\n";
+		my @temp_loci = sort_loci($temp_loci_ref->{$temp_strand});
+		@{$temp_loci_ref->{$temp_strand}} = @temp_loci;
+	}
+
+	return 1;
+}
+
+#Sort loci
+sub sort_loci{
+	my ($temp_sref, $temp_start) = @_;
+	return if(ref($temp_sref) ne 'ARRAY');
+
+	if(!defined $temp_start){
+		if(wantarray){
+			my @temp_sets = map {[@{$_}]} @{$temp_sref};
+			$temp_sref = \@temp_sets;
+		}
+		@{$temp_sref} = sort {$a->[0]<=>$b->[0] || $a->[1]<=>$b->[1]} @{$temp_sref};
+		$temp_start = 0;
+	}
+	my $temp_last = $temp_sref->[$temp_start];
+	$temp_start++;
+
+	if(@{$temp_last}){
+		for(my $i = $temp_start; $i < @{$temp_sref}; $i++){
+		my $temp_cur = $temp_sref->[$i];
+			if(!@{$temp_cur}){
+				next;
+			}
+
+			if ($temp_cur->[0] >= $temp_last->[0] && $temp_cur->[0] <= $temp_last->[1] ){
+				if ($temp_cur->[1] > $temp_last->[1]){
+					$temp_last->[1] = $temp_cur->[1];
+				}
+
+				foreach my $temp_cur_eej (keys %{$temp_cur->[2]}){
+					if(exists $temp_last->[2]{$temp_cur_eej}){
+						push(@{$temp_last->[2]{$temp_cur_eej}}, @{$temp_cur->[2]{$temp_cur_eej}});
+						my @temp_new_transcript = merge_transcript($temp_last->[2]{$temp_cur_eej});
+						@{$temp_last->[2]{$temp_cur_eej}} = @temp_new_transcript;
+					}
+					else{
+						@{$temp_last->[2]{$temp_cur_eej}} = merge_transcript($temp_cur->[2]{$temp_cur_eej});
+					}
+				}
+				@{$temp_cur} = ();
+			}
+			else{
+				last;
+			}
+		}
+	}
+	if($temp_start < @{$temp_sref}){
+		sort_loci($temp_sref, $temp_start);
+	}
+	if(wantarray){
+
+		return sort {$a->[0] <=> $b->[0]} map {@{$_} ? $_ : () } @{$temp_sref};
+	}
+}
+
+#Merge transcripts with the same exon-exon junction in the same locus
+sub merge_transcript{
+	my ($temp_sref, $temp_start) = @_;
+	if(!defined $temp_start){
+		if(wantarray){
+			my @temp_sets = map {[@{$_}]} @{$temp_sref};
+			$temp_sref = \@temp_sets;
+		}
+		@{$temp_sref} = sort {$a->[0]<=>$b->[0] || $a->[1]<=>$b->[1]} @{$temp_sref};
+		$temp_start = 0;
+	}
+	my $temp_last = $temp_sref->[$temp_start];
+	$temp_start++;
+
+	if(@{$temp_last}){
+		#print "@{$temp_last}\n";
+		for(my $i = $temp_start; $i < @{$temp_sref}; $i++){
+			my $temp_cur = $temp_sref->[$i];
+			if(!@{$temp_cur}){
+				next;
+			}
+
+			if (($temp_cur->[0] >= $temp_last->[0]) && ($temp_cur->[0] <= $temp_last->[1])){
+				if ($temp_cur->[1] > $temp_last->[1]){
+					$temp_last->[1] = $temp_cur->[1];
+				}
+				$temp_last->[2] += $temp_cur->[2];
+				my %temp_last_ends = %{$temp_last->[3]};
+				my %temp_cur_ends = %{$temp_cur->[3]};
+				foreach my $temp_ends (keys %temp_cur_ends){
+					unless(exists $temp_last_ends{$temp_ends}){
+						$temp_last_ends{$temp_ends} = 0;
+					}
+					$temp_last_ends{$temp_ends} += $temp_cur_ends{$temp_ends};
+				}
+				$temp_last->[3] = \%temp_last_ends;
+				my %temp_last_polya_flag = %{$temp_last->[4]};
+				my %temp_cur_polya_flag = %{$temp_cur->[4]};
+				foreach my $temp_polya_flag (keys %temp_cur_polya_flag){
+					unless(exists $temp_last_polya_flag{$temp_polya_flag}){
+						$temp_last_polya_flag{$temp_polya_flag} = 0;
+					}
+					$temp_last_polya_flag{$temp_polya_flag} += $temp_cur_polya_flag{$temp_polya_flag};
+				}
+				$temp_last->[4] = \%temp_last_polya_flag;
+				@{$temp_cur} = ();
+			}
+			else{
+				last;
+			}
+		}
+	}
+	if($temp_start < @{$temp_sref}){
+		merge_transcript($temp_sref, $temp_start);
+	}
+	if(wantarray){
+		return sort {$a->[0] <=> $b->[0]} map {@{$_} ? $_ : () } @{$temp_sref};
+	}
+}
+
+#Find the nearest intervals from a list of a specifed interval
+sub find_nearest{
+	my ($temp_query_ref, $temp_db_array_ref, $temp_db_hash_ref, $temp_strand, $temp_min_junc_dist, $temp_junc_dist_ref) = @_;
+	my $temp_nearest_dist = "NA";
+	my @temp_nearest_splice_site = (0, 0);
+	my $temp_coverage = 0;
+	my $temp_num_db = @{$temp_db_array_ref};
+	my $temp_cutoff = ($temp_min_junc_dist ** 3 / 3) + ($temp_min_junc_dist ** 2 / 2) + ($temp_min_junc_dist / 6);
+	#Search the reference exon-exon junctions within the specified minimal distance first if the number of intervales in the database is larger than the specified minimal distance
+	if($temp_num_db > $temp_cutoff){
+		SEARCH:for(my $temp_dist = 0; $temp_dist < $temp_min_junc_dist; $temp_dist++){
+			for(my $temp_offset = 0; $temp_offset <= $temp_dist; $temp_offset++){
+				my %temp_left = (($temp_query_ref->[0] - $temp_offset), 1, ($temp_query_ref->[0] + $temp_offset), 1);
+				my %temp_right = (($temp_query_ref->[1] - ($temp_dist - $temp_offset)), 1, ($temp_query_ref->[1] + ($temp_dist - $temp_offset)), 1);
+				foreach my $temp_left (keys %temp_left){
+					foreach my $temp_right (keys %temp_right){
+						if(exists $temp_db_hash_ref->{$temp_left}{$temp_right}){
+							if($temp_db_hash_ref->{$temp_left}{$temp_right} > $temp_coverage){
+								@temp_nearest_splice_site = ($temp_left, $temp_right, $temp_db_hash_ref->{$temp_left}{$temp_right});
+								$temp_nearest_dist = $temp_dist;
+								$temp_coverage = $temp_db_hash_ref->{$temp_left}{$temp_right};
+							}
+						}
+					}
+				}
+			}
+			if($temp_nearest_dist ne "NA"){
+				last SEARCH;
+			}
+		}
+	}
+	#If the searching with the specified minimal distance fails, perform the exhausted search
+	if($temp_nearest_dist eq "NA"){
+		foreach my $temp_db (@{$temp_db_array_ref}){
+			my $temp_dist = abs($temp_query_ref->[0] - $temp_db->[0]) + abs($temp_query_ref->[1] - $temp_db->[1]);
+			if(($temp_dist < $temp_nearest_dist) || (($temp_dist == $temp_nearest_dist) && ($temp_db->[2] > $temp_coverage)) || ($temp_nearest_dist eq "NA")){
+				@temp_nearest_splice_site = @{$temp_db};
+				$temp_nearest_dist = $temp_dist;
+				$temp_coverage = $temp_db->[2];
+			}
+		}
+	}
+	#print "\tNearest overlap @temp_nearest_splice_site of distance $temp_nearest_dist\n";
+	unless($temp_junc_dist_ref->{$temp_strand}){
+		%{$temp_junc_dist_ref->{$temp_strand}} = ();
+	}
+	my $temp_query = join(",", @{$temp_query_ref});
+	my $temp_nearest_splice_site = join(",", @temp_nearest_splice_site);
+	unless(exists $temp_junc_dist_ref->{$temp_strand}{$temp_query}){
+		%{$temp_junc_dist_ref->{$temp_strand}{$temp_query}} = ();
+	}
+	unless(exists $temp_junc_dist_ref->{$temp_strand}{$temp_query}{$temp_nearest_splice_site}){
+		$temp_junc_dist_ref->{$temp_strand}{$temp_query}{$temp_nearest_splice_site} = $temp_nearest_dist;
+	}
+
+	if($temp_nearest_dist <= $temp_min_junc_dist){
+		return \@temp_nearest_splice_site;
+	}
+	else{
+
+		return 0;
+	}
+}
+
+#Perform exon-exon junction correction
+sub correct_eej{
+	my ($temp_loci_ref, $temp_ref_eej_array_ref, $temp_ref_eej_hash_ref, $temp_min_junc_dist, $temp_junc_dist_ref) = @_;
+	my $temp_num_filtered_junc_dist = 0;
+	foreach my $temp_strand (keys %$temp_loci_ref){
+		#print "Strand:$temp_strand\n";
+		foreach my $temp_locus (@{$temp_loci_ref->{$temp_strand}}){
+			#print "Loci:@{$temp_loci}\n";
+			EEJ:foreach my $temp_eej (keys %{$temp_locus->[2]}){
+				#print "\tEEJ_before:$temp_eej\n\t@{$temp_loci->[2]{$temp_eej}}\n";
+				if($temp_eej eq "-"){
+					#Skip the correction step for mono-exonic transcript
+					#print "\tNo correction for mono-exonic transcript.\n";
+					next EEJ;
+				}
+				my @temp_eej = split('-', $temp_eej);
+				#Shift to eliminate the empty value at the first position of the array
+				shift @temp_eej;
+				my @temp_nearest_splice_site;
+				my $temp_corrected_eej = "-";
+				my $temp_cur_leftmost = $temp_locus->[2]{$temp_eej}[0][0];
+				my $temp_cur_rightmost = $temp_locus->[2]{$temp_eej}[0][1];
+				foreach my $temp_splice_site (@temp_eej){
+					my @temp_splice_site = split(',', $temp_splice_site);
+					#print "\tComparing @temp_splice_site and @{$ref_eej_array_ref->{$current_chr}{$temp_strand}}\n";
+					my $temp_nearest_splice_site_ref = find_nearest(\@temp_splice_site, \@{$temp_ref_eej_array_ref->{$temp_strand}}, \%{$temp_ref_eej_hash_ref->{$temp_strand}}, $temp_strand, $temp_min_junc_dist, $temp_junc_dist_ref);
+					#Can correct one of the splice junction
+					if($temp_nearest_splice_site_ref){
+						#print "\tFound the nearest splice junction:@{$temp_nearest_splice_site_ref}\n";
+						#Valid splice junction
+						if(($temp_nearest_splice_site_ref->[0] >= $temp_cur_leftmost) && ($temp_nearest_splice_site_ref->[1] <= $temp_cur_rightmost)){
+							#Keep the valid junction
+							#print "\tThis is a valid splice junction.\n";
+							$temp_corrected_eej .= $temp_nearest_splice_site_ref->[0] . "," . $temp_nearest_splice_site_ref->[1] . "-";
+							$temp_cur_leftmost = $temp_nearest_splice_site_ref->[1];
+						}
+						#Invalid splice junction
+						else{
+							#print "\tThis is an invalid splice junction with depth $temp_loci->[2]{$temp_eej}[2]\n";
+							$temp_num_filtered_junc_dist += $temp_locus->[2]{$temp_eej}[0][2];
+							delete $temp_locus->[2]{$temp_eej};
+							next EEJ;
+						}
+					}
+					#Cannot correct one of the splice junctions
+					else{
+						#print "\tNot able to correct the splice junction with depth $temp_loci->[2]{$temp_eej}[2].\n";
+						$temp_num_filtered_junc_dist += $temp_locus->[2]{$temp_eej}[0][2];
+						delete $temp_locus->[2]{$temp_eej};
+						next EEJ;
+					}
+				}
+				#print "\tEEJ_after:$temp_corrected_eej\n";
+				if($temp_eej eq $temp_corrected_eej){
+					#print "\tNo correction needed.\n";
+					next EEJ;
+				}
+				#The corrected eej already in the record
+				if(exists $temp_locus->[2]{$temp_corrected_eej}){
+					#print "\tCorrected EEJ already exists\n";
+					#print "\tExisted correct transcript:@{$temp_loci->[2]{$temp_corrected_eej}}\n\tTranscript to be corrected:";
+					push(@{$temp_locus->[2]{$temp_corrected_eej}}, @{$temp_locus->[2]{$temp_eej}});
+					my @temp_new_transcript = merge_transcript($temp_locus->[2]{$temp_corrected_eej});
+					@{$temp_locus->[2]{$temp_corrected_eej}} = @temp_new_transcript;
+				}
+				#The corrected eej not in the record
+				else{
+					#print "\tCorrected EEJ not exist\n";
+					@{$temp_locus->[2]{$temp_corrected_eej}} = @{$temp_locus->[2]{$temp_eej}};
+				}
+				delete $temp_locus->[2]{$temp_eej};
+			}
+		}
+	}
+
+	return ($temp_num_filtered_junc_dist);
+}
+
+#Separate transcripts from loci after exon-exon junction correction
+sub break_loci{
+	my ($temp_loci_ref) = @_;
+	my %temp_loci = %$temp_loci_ref;
+	%{$temp_loci_ref} = ();
+	foreach my $temp_strand (keys %temp_loci){
+		LOCI:foreach my $temp_locus (@{$temp_loci{$temp_strand}}){
+			my %temp_eej = %{$temp_locus->[2]};
+			unless(%temp_eej){
+				next LOCI;
+			}
+			foreach my $temp_eej (keys %temp_eej){
+				foreach my $temp_transcript (@{$temp_eej{$temp_eej}}){
+					add_locus($temp_loci_ref, $temp_strand, $temp_transcript->[0], $temp_transcript->[1], $temp_eej, $temp_transcript->[2], $temp_transcript->[3], $temp_transcript->[4]);
+				}
+			}
+		}
+	}
+
+	return 1;
+}
+
+#Print the record in gtf format
+sub print_gtf{
+	my ($temp_chr, $temp_dir, $temp_loci_ref, $temp_prefix, $temp_end_dist) = @_;
+	my $temp_gtf_fh;
+	open($temp_gtf_fh, "> ${temp_dir}/${temp_chr}_out.gtf") or die "<ERROR> Cannot create ${temp_dir}/${temp_chr}_out.gtf!\n";
+	my $temp_end_dist_fh;
+	if($temp_end_dist){
+		open($temp_end_dist_fh, "> ${temp_dir}/${temp_chr}_end_dist.txt") or die "<ERROR> Cannot create ${temp_dir}/${temp_chr}_end_dist.txt!\n";
+	}
+	my %temp_strand_flag = ('+', 0, '-', 1);
+	foreach my $temp_strand (keys %$temp_loci_ref){
+		#print "Strand:$temp_strand\n";
+		my $temp_loci_count = 1;
+		LOCI:foreach my $temp_locus (@{$temp_loci_ref->{$temp_strand}}){
+			#print "Loci:@temp_loci\n";
+			my %temp_eej = %{$temp_locus->[2]};
+			unless(%temp_eej){
+				next LOCI;
+			}
+			print $temp_gtf_fh "$temp_chr\tNIAP\tgene\t$temp_locus->[0]\t$temp_locus->[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}\"\;\n";
+			my $temp_transcript_count = 1;
+			foreach my $temp_eej (sort keys %temp_eej){
+				#print "\tEEJ:$temp_eej\n\t@{$temp_eej{$temp_eej}}\n";
+				foreach my $temp_transcript (@{$temp_eej{$temp_eej}}){
+					#print "@temp_transcript\n";
+					my $temp_eej_new = $temp_transcript->[0] . $temp_eej . $temp_transcript->[1];
+					#print "$temp_eej_new\n";
+					my @temp_eej = split(',', $temp_eej_new);
+					my $temp_num_exon = @temp_eej;
+					my @temp_polya_flag = ();
+					foreach my $temp_polya_flag (keys %{$temp_transcript->[4]}){
+						push(@temp_polya_flag, "$temp_polya_flag:$temp_transcript->[4]{$temp_polya_flag}");
+					}
+					my $temp_polya_flag = join(',', @temp_polya_flag);
+					unless($temp_polya_flag){
+						$temp_polya_flag = "NA";
+					}
+					print $temp_gtf_fh "$temp_chr\tNIAP\ttranscript\t$temp_transcript->[0]\t$temp_transcript->[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}\"\; transcript_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}.${temp_transcript_count}\"\; depth \"$temp_transcript->[2]\"\; polya_flag \"$temp_polya_flag\"\;\n";
+					if($temp_end_dist){
+						print $temp_end_dist_fh "$temp_chr\t$temp_strand\t${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}\t${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}.${temp_transcript_count}\t$temp_transcript->[2]\t";
+						my @temp_ends = ();
+						foreach my $temp_ends (sort {$temp_transcript->[3]{$b} <=> $temp_transcript->[3]{$a}} keys %{$temp_transcript->[3]}){
+							$temp_ends .= ":$temp_transcript->[3]{$temp_ends}";
+							#print "$temp_chr\t$temp_strand\t$temp_ends\n";
+							push(@temp_ends, $temp_ends);
+						}
+						my $temp_ends_all = join(",", @temp_ends);
+						print $temp_end_dist_fh "$temp_ends_all\n";
+					}
+					for(my $i = 0; $i < $temp_num_exon; $i++){
+						my $temp_cur_exon_num;
+						my @temp_exon = split('-', $temp_eej[$i]);
+						#Handle exon number for record at the negative strand
+						if($temp_strand eq "-"){
+							$temp_cur_exon_num = $temp_num_exon - $i;
+						}
+						#Handle exon number for record at the positive and no strand
+						else{
+							$temp_cur_exon_num = $i + 1;
+						}
+						print $temp_gtf_fh "$temp_chr\tNIAP\texon\t$temp_exon[0]\t$temp_exon[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}\"\; transcript_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}.${temp_transcript_count}\"\; exon_number \"$temp_cur_exon_num\"\;\n";
+					}
+					$temp_transcript_count++;
+				}
+			}
+			$temp_loci_count++;
+		}
+		#Clear the old record
+		delete($temp_loci_ref->{$temp_strand});
+	}
+	close $temp_gtf_fh;
+	if($temp_end_dist){
+		close $temp_end_dist_fh;
+	}
+
+	return 1;
+}
+
+#Print the nearest distance between all unique raw splice junctions and their nearest referece splice junctions.
+sub print_junc_dist{
+	my ($temp_chr, $temp_dir, $temp_junc_dist_ref) = @_;
+	my $temp_fh;
+	open($temp_fh, "> ${temp_dir}/${temp_chr}_junc_dist.txt") or die "<ERROR> Cannot create ${temp_dir}/${temp_chr}_junc_dist.txt!\n";
+	foreach my $temp_strand (keys %$temp_junc_dist_ref){
+		foreach my $temp_query (keys %{$temp_junc_dist_ref->{$temp_strand}}){
+			foreach my $temp_nearest (keys %{$temp_junc_dist_ref->{$temp_strand}{$temp_query}}){
+				print $temp_fh "$temp_chr\t$temp_strand\t$temp_query\t$temp_nearest\t$temp_junc_dist_ref->{$temp_strand}{$temp_query}{$temp_nearest}\n";
+			}
+		}
+	}
+	close $temp_fh;
+
+	return 1;
+}
+
+
