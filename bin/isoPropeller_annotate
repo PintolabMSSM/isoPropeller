@@ -24,7 +24,7 @@ Change logs:
 	(9) Compare all remaining query monoexonic isoforms to reference monoexonic isoforms, excluding monoexonic non-coding gene. known: Require overlapping between the two monoexonic isoforms.
 	(10) Group all remaining query isoforms, including monoexonic and multiexonic, overlapping with each other into loci. 
 	(11) Classify novel genes based on https://pubmed.ncbi.nlm.nih.gov/32747822/, with reference to protein-coding genes. ncRNA_host_gene > divergent (100 bp by default) > intronic > overlapping > antisense > intergenic (sub-type overlapping)
-	v1.10	2023-10	Restructured the code. Added ref_gene_name and used gene_name corresponding to the gene_id. Modified to use NIAP_merge_1.6.pl.
+	v1.10	2023-10	Restructured the code. Added ref_gene_name and used gene_name corresponding to the gene_id. Modified to use isoPropeller_merge v1.6.
 	v1.11	2023-11	Added an option to use TSS region instead of TSS position. Modified the functions to output TSS without adding the promoter width. Revised the step for re-arranging fusion gene ID. Switched the order of the 4th and 5th passes. Added query_match and query_overlap during evaluation, and updated the ranking, query_match > query_overlap > ref_match > ref_overlap > overlap. Fixed an issue to keep gene_name updated as gene_id for novel genes. Fixed an issue of getting gtf attributes.
 	v1.12	2024-05	Fixed a bug in tss_dist. Fixed a bug in the 1st-pass when the best reference transcript is from a novel gene but there is no match of exon. Fixed the issue when the reference is empty. Minor modifications. Fixed a bug when a partial isoform is from a novel gene.
 	v1.13	2024-09	Fixed the bed file left position issue.
@@ -36,11 +36,11 @@ use List::Util qw(min max sum);
 use threads;
 use Benchmark qw(:hireswallclock);
 
-my $niap_merge = `dirname $0`;
-chomp $niap_merge;
-$niap_merge .= "/NIAP_merge.pl";
-unless(-e $niap_merge){
-	print STDERR "$niap_merge not found. Please install the script.\n";
+my $isopropeller_merge = `dirname $0`;
+chomp $isopropeller_merge;
+$isopropeller_merge .= "/isoPropeller_merge";
+unless(-e $isopropeller_merge){
+	print STDERR "$isopropeller_merge not found. Please install the script.\n";
 	exit;
 }
 
@@ -50,7 +50,7 @@ my $version = "v1.13";
 
 my ($ref, $query, $out, $max_p, $max_bd, $missing, $tss_region, $btp, $num_thread, $help) = ("", "", "", 100, 100, 0, "", "", 1, 0);
 
-my $usage = "Usage: perl NIAP_annotate.pl
+my $usage = "Usage: perl isoPropeller_annotate
 	-q <String> Input query gtf file
 	-r <String> Input reference gtf file
 	-o <String> Output file
@@ -121,8 +121,8 @@ open(my $out_fh, "> $out") or die "Cannot create $out!\n";
 my $date_format = "+%F-%T.%3N";
 my $date = `date $date_format`;
 chomp $date;
-print "[NIAP_annotate $date]\tperl NIAP_annotate_${version}.pl -q $query -r $ref -o $out -b $btp -t $num_thread -d $max_bd -p $max_p";
-print $out_fh "#perl NIAP_annotate_${version}.pl -q $query -r $ref -o $out -b $btp -t $num_thread -d $max_bd -p $max_p";
+print "[isoPropeller_annotate $date]\tperl isoPropeller_annotate_${version}.pl -q $query -r $ref -o $out -b $btp -t $num_thread -d $max_bd -p $max_p";
+print $out_fh "#perl isoPropeller_annotate_${version} -q $query -r $ref -o $out -b $btp -t $num_thread -d $max_bd -p $max_p";
 if($missing){
 	print " -m";
 	print $out_fh " -m";
@@ -141,7 +141,7 @@ print "\n";
 print $out_fh "\n";
 close $out_fh;
 
-my $dir = "${out}__NIAP_annotate_temp";
+my $dir = "${out}__isoPropeller_annotate_temp";
 if(-d $dir){
 	print STDERR "<WARNING> Temporary directory $dir exists! Will overwrite it...\n";
 	system("rm ${dir}/*");
@@ -158,7 +158,7 @@ my $total_thread = `grep -c \"^processor\" /proc/cpuinfo`;
 chomp $total_thread;
 $date = `date $date_format`;
 chomp $date;
-print "[NIAP_annotate $date]\tA total of $total_thread threads detected\n";
+print "[isoPropeller_annotate $date]\tA total of $total_thread threads detected\n";
 
 if($num_thread > $total_thread){
 	print "<WARNING> Exceeding the maximal total number of threads! Setting the number of thread to $total_thread...";
@@ -168,7 +168,7 @@ if($num_thread > $total_thread){
 my $start_time = Benchmark->new;
 $date = `date $date_format`;
 chomp $date;
-print "[NIAP_annotate $date]\tStarting preprocessing...\n";
+print "[isoPropeller_annotate $date]\tStarting preprocessing...\n";
 system("grep \$\'\\t\'\"exon\"\$\'\\t\' $ref > ${dir}/ref.gtf");
 system("grep \$\'\\t\'\"exon\"\$\'\\t\' $query > ${dir}/query.gtf");
 my $chr_ref = split_gtf("${dir}/ref.gtf", "${dir}/query.gtf", $dir);
@@ -179,7 +179,7 @@ my $finish_time = Benchmark->new;
 my $time_spent = timediff($finish_time, $start_time);
 $date = `date $date_format`;
 chomp $date;
-print "[NIAP_annotate $date]\tUsed ". timestr($time_spent) . " for preprocessing\n";
+print "[isoPropeller_annotate $date]\tUsed ". timestr($time_spent) . " for preprocessing\n";
 
 my $chr_pos = 0;
 my @thread = ();
@@ -188,7 +188,7 @@ my @running = ();
 while(@thread < @$chr_ref){
 	@running = threads->list(threads::running);
 	if(@running < $num_thread){
-		my $thread = threads->create(\&worker, $chr_ref->[$chr_pos], $niap_merge, $dir, $date_format, $max_p, $max_bd, $missing, $tss_region, $btp);
+		my $thread = threads->create(\&worker, $chr_ref->[$chr_pos], $isopropeller_merge, $dir, $date_format, $max_p, $max_bd, $missing, $tss_region, $btp);
 		push(@thread, $thread);
 		$chr_pos++;
 	}
@@ -198,33 +198,33 @@ foreach my $thread (@thread){
 	my @result = $thread->join();
 	$date = `date $date_format`;
 	chomp $date;
-	print "[NIAP_annotate $date]\tJoined for $result[0]!\n";
+	print "[isoPropeller_annotate $date]\tJoined for $result[0]!\n";
 }
 
 system("cat ${dir}/*_out.gtf | $btp sort >> $out");
 $date = `date $date_format`;
 chomp $date;
-print "[NIAP_annotate $date]\tGenerated $out!\n";
+print "[isoPropeller_annotate $date]\tGenerated $out!\n";
 system("rm -r ${dir}");
 $date = `date $date_format`;
 chomp $date;
-print "[NIAP_annotate $date]\tCleaned temporary files!\n";
+print "[isoPropeller_annotate $date]\tCleaned temporary files!\n";
 
 my $total_finish_time = Benchmark->new;
 my $total_time_spent = timediff($total_finish_time, $total_start_time);
 $date = `date $date_format`;
 chomp $date;
-print "[NIAP_annotate $date]\tTotal time used: ". timestr($total_time_spent) . "\n";
+print "[isoPropeller_annotate $date]\tTotal time used: ". timestr($total_time_spent) . "\n";
 
 sub worker{
-	my ($temp_chr, $temp_niap_merge, $temp_dir, $temp_date_format, $temp_max_p, $temp_max_bd, $temp_missing, $temp_tss_region, $temp_btp) = @_;
+	my ($temp_chr, $temp_isopropeller_merge, $temp_dir, $temp_date_format, $temp_max_p, $temp_max_bd, $temp_missing, $temp_tss_region, $temp_btp) = @_;
 	my %temp_monoexonic_gene_type = ("miRNA", 1, "misc_RNA", 1, "Mt_rRNA", 1, "Mt_tRNA", 1, "ribozyme", 1, "rRNA", 1, "rRNA_pseudogene", 1, "scaRNA", 1, "scRNA", 1, "snoRNA", 1, "snRNA", 1, "sRNA", 1, "vaultRNA", 1);
 	my %temp_pc_gene_type = ("protein_coding", 1);
 	my %temp_immune_gene_type = ("IG_C_gene", 1, "IG_C_pseudogene", 1, "IG_D_gene", 1, "IG_J_gene", 1, "IG_J_pseudogene", 1, "IG_pseudogene", 1, "IG_V_gene", 1, "IG_V_pseudogene", 1, "TR_C_gene", 1, "TR_D_gene", 1, "TR_J_gene", 1, "TR_J_pseudogene", 1, "TR_V_gene", 1, "TR_V_pseudogene", 1);
 	my %temp_novel_cluster_count = ();
 	my $temp_date = `date $temp_date_format`;
 	chomp $temp_date;
-	print "[NIAP_annotate $temp_date]\tStarting to process $temp_chr...\n";
+	print "[isoPropeller_annotate $temp_date]\tStarting to process $temp_chr...\n";
 	my $temp_start_time = Benchmark->new;
 
 	my $temp_tss_ref;
@@ -252,7 +252,7 @@ sub worker{
 	);
 	system("cat ${temp_dir}/ref_${temp_chr}.gtf ${temp_dir}/query_${temp_chr}_novel_ref_reclustered.gtf > ${temp_dir}/ref_${temp_chr}_expanded.gtf");
 	system("echo ${temp_dir}/ref_${temp_chr}_expanded.gtf > ${temp_dir}/ref_${temp_chr}_gtf_list.txt");
-	system("perl $temp_niap_merge -i ${temp_dir}/ref_${temp_chr}_gtf_list.txt -o ${temp_dir}/ref_${temp_chr}_expanded_merged -b $temp_btp");
+	system("perl $temp_isopropeller_merge -i ${temp_dir}/ref_${temp_chr}_gtf_list.txt -o ${temp_dir}/ref_${temp_chr}_expanded_merged -b $temp_btp");
 	my $temp_loci_ref = read_loci_id("${temp_dir}/ref_${temp_chr}_expanded_merged_id.txt");
 
 	#1st-pass annotation: Identify annotated, fusion and novel transcripts of known genes and those of novel genes
@@ -282,7 +282,7 @@ sub worker{
 	);
 	$temp_date = `date $temp_date_format`;
 	chomp $temp_date;
-	print "[NIAP_annotate $temp_date]\t1st-pass annotation done for $temp_chr!\n";
+	print "[isoPropeller_annotate $temp_date]\t1st-pass annotation done for $temp_chr!\n";
 
 	#2nd-pass annotation: Annotate novel transcripts using the annotated transcripts in addition to the reference
 	my $temp_novel_ref_last_size = -1;
@@ -323,7 +323,7 @@ sub worker{
 		$temp_novel_cur_size = -s "${temp_dir}/query_${temp_chr}_novel.gtf";
 		$temp_date = `date $temp_date_format`;
 		chomp $temp_date;
-		print "[NIAP_annotate $temp_date]\t2nd-pass annotation iteration $temp_it done for $temp_chr!\n";
+		print "[isoPropeller_annotate $temp_date]\t2nd-pass annotation iteration $temp_it done for $temp_chr!\n";
 		$temp_it++;
 	}
 
@@ -365,7 +365,7 @@ sub worker{
 		$temp_novel_cur_size = -s "${temp_dir}/query_${temp_chr}_novel.gtf";
 		$temp_date = `date $temp_date_format`;
 		chomp $temp_date;
-		print "[NIAP_annotate $temp_date]\t3nd-pass annotation iteration $temp_it done for $temp_chr!\n";
+		print "[isoPropeller_annotate $temp_date]\t3nd-pass annotation iteration $temp_it done for $temp_chr!\n";
 		$temp_it++;
 	}
 
@@ -396,7 +396,7 @@ sub worker{
 	);
 	$temp_date = `date $temp_date_format`;
 	chomp $temp_date;
-	print "[NIAP_annotate $temp_date]\t4th-pass annotation done for $temp_chr!\n";
+	print "[isoPropeller_annotate $temp_date]\t4th-pass annotation done for $temp_chr!\n";
 
 	#5th-pass annotation: Annotate novel transcripts using TSS of reference, annotated and novel gene transcripts
 	$temp_novel_ref_last_size = -1;
@@ -430,7 +430,7 @@ sub worker{
 		$temp_novel_cur_size = -s "${temp_dir}/query_${temp_chr}_novel.gtf";
 		$temp_date = `date $temp_date_format`;
 		chomp $temp_date;
-		print "[NIAP_annotate $temp_date]\t5th-pass annotation iteration $temp_it done for $temp_chr!\n";
+		print "[isoPropeller_annotate $temp_date]\t5th-pass annotation iteration $temp_it done for $temp_chr!\n";
 		$temp_it++;
 	}
 
@@ -442,7 +442,7 @@ sub worker{
 	);
 	$temp_date = `date $temp_date_format`;
 	chomp $temp_date;
-	print "[NIAP_annotate $temp_date]\tNovel genes re-clustering done for $temp_chr!\n";
+	print "[isoPropeller_annotate $temp_date]\tNovel genes re-clustering done for $temp_chr!\n";
 
 	#Classify novel gene loci
 	system("cat ${temp_dir}/ref_${temp_chr}.gtf ${temp_dir}/query_${temp_chr}_annotated.gtf > ${temp_dir}/ref_${temp_chr}_expanded.gtf");
@@ -473,7 +473,7 @@ sub worker{
 	);
 	$temp_date = `date $temp_date_format`;
 	chomp $temp_date;
-	print "[NIAP_annotate $temp_date]\tClassifying novel genes done for $temp_chr!\n";
+	print "[isoPropeller_annotate $temp_date]\tClassifying novel genes done for $temp_chr!\n";
 
 	#Re-arrange the refernece gene IDs for fusion genes
 	system("cat ${temp_dir}/ref_${temp_chr}.gtf ${temp_dir}/query_${temp_chr}_annotated.gtf ${temp_dir}/query_${temp_chr}_novel_classified.gtf > ${temp_dir}/ref_${temp_chr}_expanded.gtf");
@@ -499,7 +499,7 @@ sub worker{
 	);
 	$temp_date = `date $temp_date_format`;
 	chomp $temp_date;
-	print "[NIAP_annotate $temp_date]\tRe-arranging gene IDs of fusion genes done for $temp_chr!\n";
+	print "[isoPropeller_annotate $temp_date]\tRe-arranging gene IDs of fusion genes done for $temp_chr!\n";
 
 	#Print exons
 	if($temp_missing){
@@ -511,7 +511,7 @@ sub worker{
 	}
 	$temp_date = `date $temp_date_format`;
 	chomp $temp_date;
-	print "[NIAP_annotate $temp_date]\tMerged output .gtf for $temp_chr!\n";
+	print "[isoPropeller_annotate $temp_date]\tMerged output .gtf for $temp_chr!\n";
 
 	#Print genes and transcripts
 	my ($temp_out_transcript_ref, $temp_out_gene_ref) = read_gtf("${temp_dir}/${temp_chr}_out.gtf", $temp_tss_ref);
@@ -522,13 +522,13 @@ sub worker{
 	);
 	$temp_date = `date $temp_date_format`;
 	chomp $temp_date;
-	print "[NIAP_annotate $temp_date]\tAdded genes and transcripts for $temp_chr!\n";
+	print "[isoPropeller_annotate $temp_date]\tAdded genes and transcripts for $temp_chr!\n";
 
 	my $temp_finish_time = Benchmark->new;
 	my $temp_time_spent = timediff($temp_finish_time, $temp_start_time);
 	$temp_date = `date $temp_date_format`;
 	chomp $temp_date;
-	print "[NIAP_annotate $temp_date]\tDone for $temp_chr in " . timestr($temp_time_spent) , "!\n";
+	print "[isoPropeller_annotate $temp_date]\tDone for $temp_chr in " . timestr($temp_time_spent) , "!\n";
 
 	return $temp_chr;
 }
@@ -1068,7 +1068,7 @@ sub print_exon{
 		$temp_num_exon = @{$temp_transcript_ref->{'exon'}};
 	}
 	foreach my $temp_exon_ref (@{$temp_transcript_ref->{'exon'}}){
-		print $temp_fh "$temp_transcript_ref->{'chr'}\tNIAP\texon\t$temp_exon_ref->[0]\t$temp_exon_ref->[1]\t.\t$temp_transcript_ref->{'strand'}\t.\ttranscript_id \"$temp_transcript_id\"\; exon_num \"$temp_num_exon\"\; gene_id \"$temp_gene_id\"\; gene_name \"$temp_gene_name\"\; gene_type \"$temp_gene_type\"\;";
+		print $temp_fh "$temp_transcript_ref->{'chr'}\tisoPropeller\texon\t$temp_exon_ref->[0]\t$temp_exon_ref->[1]\t.\t$temp_transcript_ref->{'strand'}\t.\ttranscript_id \"$temp_transcript_id\"\; exon_num \"$temp_num_exon\"\; gene_id \"$temp_gene_id\"\; gene_name \"$temp_gene_name\"\; gene_type \"$temp_gene_type\"\;";
 		if($temp_asm_gene_id){
 			print $temp_fh " asm_gene_id \"$temp_asm_gene_id\"\;";
 		}
@@ -1113,7 +1113,7 @@ sub print_gene_transcript{
 	my ($temp_transcript_ref, $temp_gene_ref, $temp_gtf) = @_;
 	open(my $temp_fh, ">> $temp_gtf") or die "Cannot open $temp_gtf!\n";
 	foreach my $temp_gene_id (keys %$temp_gene_ref){
-		print $temp_fh "$temp_gene_ref->{$temp_gene_id}{'chr'}\tNIAP\tgene\t$temp_gene_ref->{$temp_gene_id}{'left'}\t$temp_gene_ref->{$temp_gene_id}{'right'}\t.\t$temp_gene_ref->{$temp_gene_id}{'strand'}\t.\tgene_id \"$temp_gene_id\"\;";
+		print $temp_fh "$temp_gene_ref->{$temp_gene_id}{'chr'}\tisoPropeller\tgene\t$temp_gene_ref->{$temp_gene_id}{'left'}\t$temp_gene_ref->{$temp_gene_id}{'right'}\t.\t$temp_gene_ref->{$temp_gene_id}{'strand'}\t.\tgene_id \"$temp_gene_id\"\;";
 		if($temp_gene_ref->{$temp_gene_id}{'ref_gene_id'}){
 			print $temp_fh " ref_gene_id \"$temp_gene_ref->{$temp_gene_id}{'ref_gene_id'}\"\;";
 		}
@@ -1129,7 +1129,7 @@ sub print_gene_transcript{
 		print $temp_fh "\n";
 	}
 	foreach my $temp_transcript_id (keys %$temp_transcript_ref){
-		print $temp_fh "$temp_transcript_ref->{$temp_transcript_id}{'chr'}\tNIAP\ttranscript\t$temp_transcript_ref->{$temp_transcript_id}{'left'}\t$temp_transcript_ref->{$temp_transcript_id}{'right'}\t.\t$temp_transcript_ref->{$temp_transcript_id}{'strand'}\t.\ttranscript_id \"$temp_transcript_id\"\; gene_id \"$temp_transcript_ref->{$temp_transcript_id}{'gene_id'}\"\; gene_name \"$temp_transcript_ref->{$temp_transcript_id}{'gene_name'}\"\; gene_type \"$temp_transcript_ref->{$temp_transcript_id}{'gene_type'}\"\;";
+		print $temp_fh "$temp_transcript_ref->{$temp_transcript_id}{'chr'}\tisoPropeller\ttranscript\t$temp_transcript_ref->{$temp_transcript_id}{'left'}\t$temp_transcript_ref->{$temp_transcript_id}{'right'}\t.\t$temp_transcript_ref->{$temp_transcript_id}{'strand'}\t.\ttranscript_id \"$temp_transcript_id\"\; gene_id \"$temp_transcript_ref->{$temp_transcript_id}{'gene_id'}\"\; gene_name \"$temp_transcript_ref->{$temp_transcript_id}{'gene_name'}\"\; gene_type \"$temp_transcript_ref->{$temp_transcript_id}{'gene_type'}\"\;";
 		if($temp_transcript_ref->{$temp_transcript_id}{'asm_gene_id'}){
 			print $temp_fh " asm_gene_id \"$temp_transcript_ref->{$temp_transcript_id}{'asm_gene_id'}\"\;";
 		}
@@ -2014,7 +2014,7 @@ sub print_intron{
 		for(my $i = 1; $i < $temp_num_exon; $i++){
 			my $temp_left = $temp_merged_exon[$i-1][1] + 1;
 			my $temp_right = $temp_merged_exon[$i][0] - 1;
-			print $temp_fh "$temp_gene_exon{$temp_gene_id}{'chr'}\tNIAP\tintron\t$temp_left\t$temp_right\t.\t$temp_gene_exon{$temp_gene_id}{'strand'}\t.\tgene_id \"$temp_gene_id\"\; gene_type \"$temp_gene_exon{$temp_gene_id}{'gene_type'}\"\;\n";
+			print $temp_fh "$temp_gene_exon{$temp_gene_id}{'chr'}\tisoPropeller\tintron\t$temp_left\t$temp_right\t.\t$temp_gene_exon{$temp_gene_id}{'strand'}\t.\tgene_id \"$temp_gene_id\"\; gene_type \"$temp_gene_exon{$temp_gene_id}{'gene_type'}\"\;\n";
 		}
 	}
 	close $temp_fh;

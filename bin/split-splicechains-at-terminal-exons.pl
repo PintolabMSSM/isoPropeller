@@ -30,7 +30,7 @@ if ($sHelp) {
 
    Usage: $sScriptName -a <5prime-threshold> -b <3prime-threshold> input1 ... inputN
    
-   Take a set of NIAP output files consisting of splice chains with 3' and 5'
+   Take a set of isoPropeller output files consisting of splice chains with 3' and 5'
    terminal exon lengths and their counts, and then split chains by length.
    Each splicechain file is expected to correspond to a single sample.
    
@@ -214,21 +214,21 @@ foreach my $sSC (keys %hSCmulti){
       #----------------------------# 
            
       # Write GTF transcript entry
-      print OUTGTF join ("\t", $sChr, 'NIAP', 'transcript', $nFirstExonStart, $nLastExonEnd, '.', $sStrand, '.', "gene_id \"$sGeneID\"; transcript_id \"$sTranscriptID\";"), "\n";
+      print OUTGTF join ("\t", $sChr, 'isoPropeller', 'transcript', $nFirstExonStart, $nLastExonEnd, '.', $sStrand, '.', "gene_id \"$sGeneID\"; transcript_id \"$sTranscriptID\";"), "\n";
       die "Error: transcript end is smaller than start for $sTranscriptID\n" unless ($nFirstExonStart <= $nLastExonEnd);
       
       # Write first GTF exon entry
-      print OUTGTF join ("\t", $sChr, 'NIAP', 'exon', $nFirstExonStart, $nFirstExonEnd, '.', $sStrand, '.', "gene_id \"$sGeneID\"; transcript_id \"$sTranscriptID\";"), "\n";
+      print OUTGTF join ("\t", $sChr, 'isoPropeller', 'exon', $nFirstExonStart, $nFirstExonEnd, '.', $sStrand, '.', "gene_id \"$sGeneID\"; transcript_id \"$sTranscriptID\";"), "\n";
       die "Error: first exon end is smaller than start for $sTranscriptID\n" unless ($nFirstExonStart <= $nFirstExonEnd);
       
       # Write internal GTF exon entries    
       for ( my $i=0 ; $i<@anSpliceChain ; $i+=2 ){
-         print OUTGTF join ("\t", $sChr, 'NIAP', 'exon', $anSpliceChain[$i], $anSpliceChain[$i+1], '.', $sStrand, '.', "gene_id \"$sGeneID\"; transcript_id \"$sTranscriptID\";"), "\n";
+         print OUTGTF join ("\t", $sChr, 'isoPropeller', 'exon', $anSpliceChain[$i], $anSpliceChain[$i+1], '.', $sStrand, '.', "gene_id \"$sGeneID\"; transcript_id \"$sTranscriptID\";"), "\n";
          die "Error: internal exon end is smaller than start for $sTranscriptID\n" unless ($anSpliceChain[$i] <= $anSpliceChain[$i+1]);
       }
       
       # Write last GTF exon entry
-      print OUTGTF join ("\t", $sChr, 'NIAP', 'exon', $nLastExonStart, $nLastExonEnd, '.', $sStrand, '.', "gene_id \"$sGeneID\"; transcript_id \"$sTranscriptID\";"), "\n";
+      print OUTGTF join ("\t", $sChr, 'isoPropeller', 'exon', $nLastExonStart, $nLastExonEnd, '.', $sStrand, '.', "gene_id \"$sGeneID\"; transcript_id \"$sTranscriptID\";"), "\n";
       die "Error: last exon end is smaller than start for $sTranscriptID\n" unless ($nLastExonStart <= $nLastExonEnd);
 
       #----------------------------#

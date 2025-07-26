@@ -27,12 +27,12 @@ my $total_start_time = Benchmark->new;
 
 my $version = "v1.8.3";
 
-my ($bam, $out, $prefix, $mapq, $stp, $num_thread, $junc, $in_junc, $min_junc_dist, $junc_dist, $end_dist, $polya, $genome, $window, $frac_a_min, $length_a_min, $fprime, $fprime_dist, $ipr, $chr_list, $help) = ("", "", "NIAP", 0, "samtools", 1, "", 0, 10, 0, 0, "", "", 20, 0.6, 6, "", 100, "", "", 0);
+my ($bam, $out, $prefix, $mapq, $stp, $num_thread, $junc, $in_junc, $min_junc_dist, $junc_dist, $end_dist, $polya, $genome, $window, $frac_a_min, $length_a_min, $fprime, $fprime_dist, $ipr, $chr_list, $help) = ("", "", "isoPropeller", 0, "samtools", 1, "", 0, 10, 0, 0, "", "", 20, 0.6, 6, "", 100, "", "", 0);
 
-my $usage="Usage: perl NIAP.pl
+my $usage="Usage: isoPropeller
 	-i <String> Input bam file (Required)
 	-o <String> Output base (Required)
-	-p <String> The prefix of gene and transcirpt IDs (Default: NIAP)
+	-p <String> The prefix of gene and transcirpt IDs (Default: isoPropeller)
 	-q <Integer> Minimal mapping quality (Inclusive; default: $mapq)
 	-s <String> The path to samtools (samtools >= 1.11, default: \${PATH}/samtools)
 	-z <String> The path to tabix (Default: \${PATH}/tabix)
@@ -111,8 +111,8 @@ open(my $out_fh, "> ${out}.gtf") or die "<ERROR> Cannot create ${out}.gtf!\n";
 my $date_format = "+%F-%T.%3N";
 my $date = `date $date_format`;
 chomp $date;
-print $log_fh "[$date]\tperl NIAP_${version}.pl -i $bam -o $out -p $prefix -q $mapq -s $stp -t $num_thread";
-print $out_fh "#perl NIAP_${version}.pl -i $bam -p $prefix -o $out -q $mapq -s $stp -t $num_thread";
+print $log_fh "[$date]\tperl isoPropeller_${version}.pl -i $bam -o $out -p $prefix -q $mapq -s $stp -t $num_thread";
+print $out_fh "#perl isoPropeller_${version}.pl -i $bam -p $prefix -o $out -q $mapq -s $stp -t $num_thread";
 if($junc){
 	if(-e $junc){
 		print $log_fh " -x $junc -m $min_junc_dist";
@@ -195,7 +195,7 @@ print $log_fh "\n";
 print $out_fh "\n";
 close $out_fh;
 
-my $dir = "${out}__NIAP_temp";
+my $dir = "${out}__isoPropeller_temp";
 if(-d $dir){
 	print STDERR "<WARNNING> Temporary directory $dir exists! Will overwrite it...\n";
 	system("rm ${dir}/*");
@@ -1382,7 +1382,7 @@ sub print_gtf{
 			unless(%temp_eej){
 				next LOCI;
 			}
-			print $temp_gtf_fh "$temp_chr\tNIAP\tgene\t$temp_locus->[0]\t$temp_locus->[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}\"\;\n";
+			print $temp_gtf_fh "$temp_chr\tisoPropeller\tgene\t$temp_locus->[0]\t$temp_locus->[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}\"\;\n";
 			my $temp_transcript_count = 1;
 			foreach my $temp_eej (sort keys %temp_eej){
 				#print "\tEEJ:$temp_eej\n\t@{$temp_eej{$temp_eej}}\n";
@@ -1400,7 +1400,7 @@ sub print_gtf{
 					unless($temp_polya_flag){
 						$temp_polya_flag = "NA";
 					}
-					print $temp_gtf_fh "$temp_chr\tNIAP\ttranscript\t$temp_transcript->[0]\t$temp_transcript->[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}\"\; transcript_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}.${temp_transcript_count}\"\; depth \"$temp_transcript->[2]\"\; polya_flag \"$temp_polya_flag\"\;\n";
+					print $temp_gtf_fh "$temp_chr\tisoPropeller\ttranscript\t$temp_transcript->[0]\t$temp_transcript->[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}\"\; transcript_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}.${temp_transcript_count}\"\; depth \"$temp_transcript->[2]\"\; polya_flag \"$temp_polya_flag\"\;\n";
 					if($temp_end_dist){
 						print $temp_end_dist_fh "$temp_chr\t$temp_strand\t${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}\t${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}.${temp_transcript_count}\t$temp_transcript->[2]\t";
 						my @temp_ends = ();
@@ -1423,7 +1423,7 @@ sub print_gtf{
 						else{
 							$temp_cur_exon_num = $i + 1;
 						}
-						print $temp_gtf_fh "$temp_chr\tNIAP\texon\t$temp_exon[0]\t$temp_exon[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}\"\; transcript_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}.${temp_transcript_count}\"\; exon_number \"$temp_cur_exon_num\"\;\n";
+						print $temp_gtf_fh "$temp_chr\tisoPropeller\texon\t$temp_exon[0]\t$temp_exon[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}\"\; transcript_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}.${temp_transcript_count}\"\; exon_number \"$temp_cur_exon_num\"\;\n";
 					}
 					$temp_transcript_count++;
 				}

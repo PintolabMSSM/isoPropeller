@@ -1,6 +1,6 @@
 #!/usr/bin/env perl
 #Author: ALin
-#Purpose: To generate statistics of the transcripts ends distributions based on NIAP's output file *_end_dist.txt.
+#Purpose: To generate statistics of the transcripts ends distributions based on isoPropeller's output file *_end_dist.txt.
 #Change log:
 #	v1.2	2022-08	Added SD and maximal difference in the output.
 #	v1.3	2023-08 Added the number of of TSSs/TTSs in the output.
@@ -10,7 +10,7 @@ use Getopt::Long;
 
 my $version = "v1.3";
 
-my $usage = "Usage: perl NIAP_end_dist.pl
+my $usage = "Usage: perl isoPropeller_end_dist
 	-i <String> Input
 	-o <String> Output
 	-h <Boolean> Help

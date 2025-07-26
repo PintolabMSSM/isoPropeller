@@ -21,17 +21,17 @@ my $total_start_time = Benchmark->new;
 
 my $version = "v1.6";
 
-my $usage = "Usage: perl NIAP_merge.pl
+my $usage = "Usage: perl isoPropeller_merge
 	-i <String> Input list of .gtf file(s)
 	-o <String> Output base
 	-e <String> The atribute for the getting expression value (cov, FPKM, TPM and etc.)
-	-p <String> The prefix of gene and transcript IDs (Default: NIAP)
+	-p <String> The prefix of gene and transcript IDs (Default: isoPropeller)
 	-b <String> The path to bedtools
 	-t <Integer> Number of threads (Default: 1)
 	-h <Boolean> Help
 ";
 
-my ($in, $out, $exp, $prefix, $btp, $num_thread, $help) = ("", "", "", "NIAP", "", 1, 0);
+my ($in, $out, $exp, $prefix, $btp, $num_thread, $help) = ("", "", "", "isoPropeller", "", 1, 0);
 
 GetOptions(
 	'i=s'	=>	\$in,
@@ -67,8 +67,8 @@ open(my $out_fh, "> ${out}.gtf") or die "<ERROR> Cannot create ${out}.gtf!\n";
 my $date_format = "+%F-%T.%3N";
 my $date = `date $date_format`;
 chomp $date;
-print "[NIAP_merge $date]\tperl NIAP_merge_${version}.pl -i $in -o $out -p $prefix -b $btp -t $num_thread";
-print $out_fh "#perl NIAP_merge_${version}.pl -i $in -o $out -p $prefix -b $btp -t $num_thread";
+print "[isoPropeller_merge $date]\tperl isoPropeller_merge_${version}.pl -i $in -o $out -p $prefix -b $btp -t $num_thread";
+print $out_fh "#perl isoPropeller_merge_${version}.pl -i $in -o $out -p $prefix -b $btp -t $num_thread";
 if($exp){
 	print " -e $exp";
 	print $out_fh " -e $exp";
@@ -77,7 +77,7 @@ print "\n";
 print $out_fh "\n";
 close $out_fh;
 
-my $dir = "${out}__NIAP_merge_temp";
+my $dir = "${out}__isoPropeller_merge_temp";
 if(-d $dir){
 	print STDERR "<ERROR> Temporary directory $dir exists! Will overwrite it...\n";
 	system("rm ${dir}/*");
@@ -90,7 +90,7 @@ my $total_thread = `grep -c \"^processor\" /proc/cpuinfo`;
 chomp $total_thread;
 $date = `date $date_format`;
 chomp $date;
-print "[NIAP_merge $date]\tA total of $total_thread threads detected\n";
+print "[isoPropeller_merge $date]\tA total of $total_thread threads detected\n";
 
 if($num_thread > $total_thread){
 	print "<WARNING> Exceeding the maximal total number of threads! Setting the number of thread to $total_thread...";
@@ -100,13 +100,13 @@ if($num_thread > $total_thread){
 my $start_time = Benchmark->new;
 $date = `date $date_format`;
 chomp $date;
-print "[NIAP_merge $date]\tStarting preprocessing...\n";
+print "[isoPropeller_merge $date]\tStarting preprocessing...\n";
 my $chr_ref = get_chromosome($in);
 my $finish_time = Benchmark->new;
 my $time_spent = timediff($finish_time, $start_time);
 $date = `date $date_format`;
 chomp $date;
-print "[NIAP_merge $date]\tUsed ". timestr($time_spent) . " for preprocessing\n";
+print "[isoPropeller_merge $date]\tUsed ". timestr($time_spent) . " for preprocessing\n";
 
 my $chr_pos = 0;
 my @thread = ();
@@ -125,7 +125,7 @@ foreach my $thread (@thread){
 	my @result = $thread->join();
 	$date = `date $date_format`;
 	chomp $date;
-	print "[NIAP_merge $date]\tJoined for $result[0]!\n";
+	print "[isoPropeller_merge $date]\tJoined for $result[0]!\n";
 }
 
 system("cat ${dir}/*.gtf | sort -k 1,1 -k 4,4n >> ${out}.gtf");
@@ -148,34 +148,34 @@ if($exp){
 }
 $date = `date $date_format`;
 chomp $date;
-print "[NIAP_merge $date]\tGenerated output files!\n";
+print "[isoPropeller_merge $date]\tGenerated output files!\n";
 system("rm -r ${dir}");
 $date = `date $date_format`;
 chomp $date;
-print "[NIAP_merge $date]\tCleaned temporary files!\n";
+print "[isoPropeller_merge $date]\tCleaned temporary files!\n";
 
 my $total_finish_time = Benchmark->new;
 my $total_time_spent = timediff($total_finish_time, $total_start_time);
 $date = `date $date_format`;
 chomp $date;
-print "[NIAP_merge $date]\tTotal time used: ". timestr($total_time_spent) . "\n";
+print "[isoPropeller_merge $date]\tTotal time used: ". timestr($total_time_spent) . "\n";
 
 sub worker{
 	my ($temp_chr, $temp_dir, $temp_date_format, $temp_in, $temp_exp, $temp_prefix) = @_;
 	my $temp_date = `date $temp_date_format`;
 	chomp $temp_date;
-	print "[NIAP_merge $temp_date]\tStarting to process $temp_chr...\n";
+	print "[isoPropeller_merge $temp_date]\tStarting to process $temp_chr...\n";
 	my $temp_start_time = Benchmark->new;
 	my ($temp_loci_ref, $temp_sample_ref) = parse_list($temp_chr, $temp_in, $temp_exp);
 	$temp_date = `date $temp_date_format`;
 	chomp $temp_date;
-	print "[NIAP_merge $temp_date]\tParsing file list done for $temp_chr!\n";
+	print "[isoPropeller_merge $temp_date]\tParsing file list done for $temp_chr!\n";
 	print_gtf_exp($temp_loci_ref, $temp_sample_ref, $temp_chr, $temp_dir, $temp_in, $temp_exp, $temp_prefix);
 	my $temp_finish_time = Benchmark->new;
 	my $temp_time_spent = timediff($temp_finish_time, $temp_start_time);
 	$temp_date = `date $temp_date_format`;
 	chomp $temp_date;
-	print "[NIAP_merge $temp_date]\tDone for $temp_chr in " . timestr($temp_time_spent) , "!\n";
+	print "[isoPropeller_merge $temp_date]\tDone for $temp_chr in " . timestr($temp_time_spent) , "!\n";
 
 	return $temp_chr;
 }
@@ -665,7 +665,7 @@ sub print_gtf_exp{
 			my ($temp_sub_loci_ref, $temp_sub_loci_region_ref) = locus_sub_cluster($temp_locus);
 			#print "$temp_chr\t$temp_strand\t$temp_loci\n";
 			foreach my $temp_sub_locus (keys %$temp_sub_loci_region_ref){
-				print $temp_gtf_fh "$temp_chr\tNIAP\tgene\t$temp_sub_loci_region_ref->{$temp_sub_locus}->[0]\t$temp_sub_loci_region_ref->{$temp_sub_locus}->[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}_${temp_sub_locus}\"\;\n";
+				print $temp_gtf_fh "$temp_chr\tisoPropeller\tgene\t$temp_sub_loci_region_ref->{$temp_sub_locus}->[0]\t$temp_sub_loci_region_ref->{$temp_sub_locus}->[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}_${temp_sub_locus}\"\;\n";
 			}
 			my $temp_transcript_count = 1;
 			foreach my $temp_eej (sort keys %{$temp_locus->[2]}){
@@ -673,7 +673,7 @@ sub print_gtf_exp{
 					my $temp_eej_new = $temp_transcript->[0]. $temp_eej . $temp_transcript->[1];
 					my @temp_eej = split(',', $temp_eej_new);
 					my $temp_num_exon = @temp_eej;
-					print $temp_gtf_fh "$temp_chr\tNIAP\ttranscript\t$temp_transcript->[0]\t$temp_transcript->[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}_$temp_sub_loci_ref->{$temp_eej_new}\"\; transcript_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}.${temp_transcript_count}\"\;\n";
+					print $temp_gtf_fh "$temp_chr\tisoPropeller\ttranscript\t$temp_transcript->[0]\t$temp_transcript->[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}_$temp_sub_loci_ref->{$temp_eej_new}\"\; transcript_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}.${temp_transcript_count}\"\;\n";
 					for(my $i = 0; $i < $temp_num_exon; $i++){
 						my $temp_cur_exon_num;
 						my @temp_exon = split('-', $temp_eej[$i]);
@@ -685,7 +685,7 @@ sub print_gtf_exp{
 						else{
 							$temp_cur_exon_num = $i + 1;
 						}
-						print $temp_gtf_fh "$temp_chr\tNIAP\texon\t$temp_exon[0]\t$temp_exon[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}_$temp_sub_loci_ref->{$temp_eej_new}\"\; transcript_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}.${temp_transcript_count}\"\; exon_number \"$temp_cur_exon_num\"\;\n";
+						print $temp_gtf_fh "$temp_chr\tisoPropeller\texon\t$temp_exon[0]\t$temp_exon[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}_$temp_sub_loci_ref->{$temp_eej_new}\"\; transcript_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}.${temp_transcript_count}\"\; exon_number \"$temp_cur_exon_num\"\;\n";
 					}
 					if($temp_exp){
 						print $temp_exp_fh "${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}.${temp_transcript_count}";
