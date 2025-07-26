@@ -9,7 +9,7 @@ source:
   git_url: git@github.com:PintolabMSSM/{{ name }}.git
 
 build:
-  number: 2
+  number: 4
   noarch: generic
 
 requirements:
@@ -20,7 +20,9 @@ requirements:
     - perl-bioperl
     - perl-getopt-long
     - perl-list-moreutils
-    - perl
+    - samtools
+    - bedtools
+    - htslib
 
 test:
   commands:
