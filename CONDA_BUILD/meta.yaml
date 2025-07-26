@@ -14,19 +14,19 @@ build:
 
 requirements:
   build:
-    - perl
+    - perl=5.32.1
     - perl-bioperl
     - perl-getopt-long
     - perl-list-moreutils
-    - samtools
+    - samtools=1.11
     - bedtools
     - htslib
   run:
-    - perl
+    - perl=5.32.1
     - perl-bioperl
     - perl-getopt-long
     - perl-list-moreutils
-    - samtools
+    - samtools=1.11
     - bedtools
     - htslib
 
