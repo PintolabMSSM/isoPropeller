@@ -4,31 +4,31 @@ This is a pipeline for isoform identification and annotation using using GENCODE
 
 ![NIAP_collapse](https://github.com/PintolabMSSM/isoseq_map_analysis/assets/34832128/7d6f84ca-8968-43a2-a7ad-c74be0cfc77d)
 
-The script `NIAP.pl` is used to collapse reads in a .bam file into isoforms in a .gtf file. Reads that are likely intrapriming are filtered out. Monoexonic reads without 5' support are also filtered out. Multiexonic reads with the exact set of exon-exon junction(s) and being mapped in the same direction will be collapsed into one transcript. On the other hand, overlapping monoexonic transcripts will be merged to generate one transcript. In both cases, the longest 5' and 3' ends, among the transcripts to be merged, will be taken as the boundaries of the transcript. The distribution of all 5' and 3' ends will also be recorded.
+The `isoPropeller` command is used to collapse reads in a .bam file into isoforms in a .gtf file. Reads that are likely intrapriming are filtered out. Monoexonic reads without 5' support are also filtered out. Multiexonic reads with the exact set of exon-exon junction(s) and being mapped in the same direction will be collapsed into one transcript. On the other hand, overlapping monoexonic transcripts will be merged to generate one transcript. In both cases, the longest 5' and 3' ends, among the transcripts to be merged, will be taken as the boundaries of the transcript. The distribution of all 5' and 3' ends will also be recorded.
 
 ```
-perl NIAP.pl -i <prefix>.bam -e -p <prefix> -o <prefix> -g <genome .fa> -f /sc/arion/work/pintod02/opt/isoseq_pipeline/data/combined_cage_Pitt-Fantom5-119FrontalLob_refTSS3.3_refseq_gencode_extended.merged.sorted_chr.bed -t <number of threads>
+perl isoPropeller -i <prefix>.bam -e -p <prefix> -o <prefix> -g <genome .fa> -f /sc/arion/work/pintod02/opt/isoseq_pipeline/data/combined_cage_Pitt-Fantom5-119FrontalLob_refTSS3.3_refseq_gencode_extended.merged.sorted_chr.bed -t <number of threads>
 grep $'\t'"transcript"$'\t' <prefix>.gtf | grep "^chr" | grep -v "^chrM" | grep -v "depth \"1\"" | cut -d'"' -f4 > temp_transcript_id.txt
 perl select_gtf_by_attribute_list.pl <prefix>.gtf <prefix>_1more.gtf temp_transcript_id.txt transcript_id
 rm temp_transcript_id.txt
 ```
 
-NIAP, by default, will filter out reads predicted as intrapriming, which can be adjusted using the `-w`, `-r` and `-v` options. Alternatively, considering the accuracy of 3' end in long-read data, it is reasonable to keep an intrapriming read if its 3' end is close to any annotated 3' ends. NIAP provides an option, `-l`, to specify a bed file including regions that are close to any annotated 3' ends. For example, these regions can include any annotated 3' terminal exon plus 500 nucleotides downstream.
+IsoPropeller, by default, will filter out reads predicted as intrapriming, which can be adjusted using the `-w`, `-r` and `-v` options. Alternatively, considering the accuracy of 3' end in long-read data, it is reasonable to keep an intrapriming read if its 3' end is close to any annotated 3' ends. IsoPropeller provides an option, `-l`, to specify a bed file including regions that are close to any annotated 3' ends. For example, these regions can include any annotated 3' terminal exon plus 500 nucleotides downstream.
 
 ```
 perl prepare_intrapriming_rescue_bed.pl -i gencode.v41.annotation.gtf -o gencode.v41.annotation_500bp -d 500
-perl NIAP.pl -i <prefix>.bam -e -p <prefix> -o <prefix> -g <genome .fa> -f /sc/arion/work/pintod02/opt/isoseq_pipeline/data/combined_cage_Pitt-Fantom5-119FrontalLob_refTSS3.3_refseq_gencode_extended.merged.sorted_chr.bed -l gencode.v41.annotation_500bp_terminal.bed -t <number of threads>
+perl isoPropeller -i <prefix>.bam -e -p <prefix> -o <prefix> -g <genome .fa> -f /sc/arion/work/pintod02/opt/isoseq_pipeline/data/combined_cage_Pitt-Fantom5-119FrontalLob_refTSS3.3_refseq_gencode_extended.merged.sorted_chr.bed -l gencode.v41.annotation_500bp_terminal.bed -t <number of threads>
 ```
 
 ## Merging multiple samples
 
 ![NIAP_merge](https://user-images.githubusercontent.com/34832128/189032861-50eb555b-ff9b-4b69-9bdf-60dd28472765.png)
 
-The script `NIAP_merge.pl` is used to merge the isofrom .gtf files of different samples by merging isoforms with the same structure and renaming consistently. Multiexonic transcirpts with the exact set of exon-exon junction(s) and being transcribed from the same direction will be merged into one representative transcript. On the other hand, overlapping monoexonic transcripts will be merged to generate a representative transcript. In both cases, the longest 5' and 3' ends, among the transcripts to be merged, will be taken for the representative transcript. A schematic illustration is shown above.
+The script `isoPropeller_merge` is used to merge the isofrom .gtf files of different samples by merging isoforms with the same structure and renaming consistently. Multiexonic transcirpts with the exact set of exon-exon junction(s) and being transcribed from the same direction will be merged into one representative transcript. On the other hand, overlapping monoexonic transcripts will be merged to generate a representative transcript. In both cases, the longest 5' and 3' ends, among the transcripts to be merged, will be taken for the representative transcript. A schematic illustration is shown above.
 
 ```
 for gtf in `ls *_1more.gtf`; do echo $gtf; done > temp_gtf_list.txt
-perl NIAP_merge.pl -i temp_gtf_list.txt -o MAP -p MAP -e depth -t <number of threads>
+perl isoPropeller_merge -i temp_gtf_list.txt -o MAP -p MAP -e depth -t <number of threads>
 rm temp_gtf_list.txt
 ```
 
@@ -40,11 +40,11 @@ The IDs of a gene and a transcript after merging as `"MAP_<CHR>_[01]_<LOCI_NUM>_
 
 ## Clustering of unique splice chain based on 5' and 3' ends
 
-The merged multiexonic isoforms can be further split to different isoforms clusters based on their 5' and 3' ends using the `NIAP_merge_split.pl` script. The output files `*_end_dist.txt` from the **Isoform identification** step for all samples are needed, as well as the `MAP_id.txt` file from the **Merging multiple samples**.
+The merged multiexonic isoforms can be further split to different isoforms clusters based on their 5' and 3' ends using the `isoPropeller_merge_split` script. The output files `*_end_dist.txt` from the **Isoform identification** step for all samples are needed, as well as the `MAP_id.txt` file from the **Merging multiple samples**.
 
 ```
 for ed in `ls *_end_dist.txt`; do echo $ed; done > temp_end_dist_list.txt
-perl NIAP_merge_split.pl -i temp_end_dist_list.txt -o MAP_clustered -g MAP.gtf -d MAP_id.txt -t <number of threads>
+perl isoPropeller_merge_split -i temp_end_dist_list.txt -o MAP_clustered -g MAP.gtf -d MAP_id.txt -t <number of threads>
 rm temp_end_dist_list.txt
 ```
 
@@ -56,7 +56,7 @@ Since the TSSs/TTSs are variable according to the data, the regions, instead of 
 
 ```
 for ed in `ls *_end_dist.txt`; do echo $ed; done > temp_end_dist_list.txt
-perl NIAP_end_region.pl -i temp_end_dist_list.txt -o MAP -d MAP_id.txt -t <number of threads>
+perl isoPropeller_end_region -i temp_end_dist_list.txt -o MAP -d MAP_id.txt -t <number of threads>
 rm temp_end_dist_list.txt
 ```
 
@@ -81,11 +81,11 @@ Each of the above metrics can be combined across all samples into a matrix for d
 for ed in `ls *_end_dist.txt`
 do
   prefix=`basename $ed .txt`
-  perl NIAP_end_dist.pl -i $ed -o ${ed}_parsed.txt
+  perl isoPropeller_end_dist -i $ed -o ${ed}_parsed.txt
 done
 
 for ed in `ls *_end_dist_parsed.txt`; do echo $ed; done > temp_end_dist_list.txt
-perl NIAP_merge_end_dist.pl -i temp_end_dist_list.txt -o MAP -m MAP_id.txt
+perl isoPropeller_merge_end_dist -i temp_end_dist_list.txt -o MAP -m MAP_id.txt
 
 for type in `echo ends_entropy tss_entropy tss_mass_center tss_max_diff tss_sd tts_entropy tts_mass_center tts_max_diff tts_sd`
 do
@@ -105,7 +105,7 @@ In this step, all isoforms in the map will be compared with the reference annota
 The output file `MAP.gtf` will be used in the step. The output file `MAP_gencode.gtf` will contain the annotated information.
 
 ```
-perl NIAP_annotate.pl -q MAP.gtf -r gencode.v41.annotation.gtf -o MAP_gencode.gtf -e /sc/arion/projects/EPIASD/IsoSeq_ourdata/NIAP_merged/MAP_cleaned_unfiltered_tss.bed -t <number of threads>
+perl isoPropeller_annotate -q MAP.gtf -r gencode.v41.annotation.gtf -o MAP_gencode.gtf -e /sc/arion/projects/EPIASD/IsoSeq_ourdata/NIAP_merged/MAP_cleaned_unfiltered_tss.bed -t <number of threads>
 ```
 
 In order to extract the annotation, the block below can be used.
@@ -115,4 +115,3 @@ for attribute in `echo ref_transcript_id asm_gene_id ref_gene_id gene_type gene_
 perl gtf2summary.pl -i MAP_gencode.gtf -o MAP_gencode -a temp_attribute_list.txt -j merged-intropolis-PEC-GTEX-owndata.SJ.out.tab -r -t <number of threads>
 ```
 
-Detailed description of NIAP and be found at https://github.com/alanlamsiu/NIAP/.
