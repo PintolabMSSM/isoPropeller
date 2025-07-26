@@ -9,12 +9,18 @@ source:
   git_url: git@github.com:PintolabMSSM/{{ name }}.git
 
 build:
-  number: 4
+  number: 5
   noarch: generic
 
 requirements:
   build:
     - perl
+    - perl-bioperl
+    - perl-getopt-long
+    - perl-list-moreutils
+    - samtools
+    - bedtools
+    - htslib
   run:
     - perl
     - perl-bioperl
