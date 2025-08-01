@@ -77,8 +77,7 @@ print "\n";
 print $out_fh "\n";
 close $out_fh;
 
-my $tmp_base = $ENV{'__LSF_JOB_TMPDIR__'} // $ENV{'TMPDIR'} // "./";
-my $dir = "$tmp_base/${out}__isoPropeller_merge_temp";
+my $dir = "${out}__isoPropeller_merge_temp";
 if(-d $dir){
 	print STDERR "<ERROR> Temporary directory $dir exists! Will overwrite it...\n";
 	system("rm ${dir}/*");
