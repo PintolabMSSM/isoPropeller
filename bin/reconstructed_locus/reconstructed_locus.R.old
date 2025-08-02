@@ -1,0 +1,56 @@
+#!/usr/bin/env Rscript
+
+args=commandArgs(trailingOnly=TRUE)
+
+#Input fusion gene ratio
+ratio=read.table(paste(args[1], "_fusion_gene_ratio.txt", sep=""), header=TRUE, sep="\t")
+
+#All sample
+selected=c("flcount_CBL.DP19_hifi", "flcount_CBL.DP20_hifi", "flcount_CBL.DP21_hifi", "flcount_CBL.DP22_hifi", "flcount_CBL.pool.OF3_hifi", "flcount_CTL1_pool", "flcount_CTL2_pool", "flcount_FB.pool.OF21_hifi", "flcount_FL_combined", "flcount_HBCC_1039_PFC_hifi", "flcount_HBCC_1051_PFC_hifi", "flcount_HBCC_1054_PFC_hifi", "flcount_HBCC_1150_PFC_hifi", "flcount_HBCC_1185_PFC_hifi", "flcount_HBCC_1275_PFC_hifi", "flcount_HBCC_1325_PFC_hifi", "flcount_HBCC_1563_PFC_hifi", "flcount_HBCC_1615_PFC_hifi", "flcount_HBCC_1883_PFC_hifi", "flcount_HBCC_1927_PFC_hifi", "flcount_HBCC_2543_PFC_hifi", "flcount_HBCC_2587_PFC_hifi", "flcount_HBCC_846_PFC_hifi", "flcount_HBCC_894_PFC_hifi", "flcount_HBCC_910_PFC_hifi", "flcount_HBCC_977_PFC_hifi", "flcount_HSB_combined", "flcount_PFC.DP13_hifi", "flcount_PFC.DP14_hifi", "flcount_PFC.DP15_hifi", "flcount_PFC.DP16_hifi", "flcount_SF1156_DLPFC", "flcount_SF1156_Hippocampus", "flcount_SF1156_dACC", "flcount_SF1227_DLPFC_hifi", "flcount_SF1227_dACC_hifi", "flcount_SF1227_hippocampus_hifi", "flcount_SF1390_DLPFC", "flcount_SF1390_dACC", "flcount_SF2052_DLPFC_hifi", "flcount_SF2780_DLPFC", "flcount_SF2780_Hippocampus", "flcount_SF2780_dACC", "flcount_SF2781_DLPFC", "flcount_SF2781_Hippocampus", "flcount_SF2781_dACC_hifi", "flcount_SF2791_DLPFC", "flcount_SF2791_Hippocampus", "flcount_SF2791_dACC", "flcount_cerebellumPool", "flcount_humfetalbrainpool_clontech")
+ratio$num_passed_sample_all=rowSums(ratio[, selected]>0.5)
+ratio$num_failed_sample_all=rowSums((ratio[, selected]>0)&(ratio[, selected]<=0.5))
+ratio$num_missing_sample_all=rowSums(ratio[, selected]==0)
+ratio$num_empty_sample_all=rowSums(ratio[, selected]==-1)
+
+#CBL sample
+selected=c("flcount_CBL.DP19_hifi", "flcount_CBL.DP20_hifi", "flcount_CBL.DP21_hifi", "flcount_CBL.DP22_hifi", "flcount_CBL.pool.OF3_hifi", "flcount_PFC.DP14_hifi", "flcount_cerebellumPool")
+ratio$num_passed_sample_cbl=rowSums(ratio[, selected]>0.5)
+ratio$num_failed_sample_cbl=rowSums((ratio[, selected]>0)&(ratio[, selected]<=0.5))
+ratio$num_missing_sample_cbl=rowSums(ratio[, selected]==0)
+ratio$num_empty_sample_cbl=rowSums(ratio[, selected]==-1)
+
+#CTX sample
+selected=c("flcount_CTL1_pool", "flcount_CTL2_pool", "flcount_FL_combined", "flcount_HBCC_1039_PFC_hifi", "flcount_HBCC_1051_PFC_hifi", "flcount_HBCC_1054_PFC_hifi", "flcount_HBCC_1150_PFC_hifi", "flcount_HBCC_1185_PFC_hifi", "flcount_HBCC_1275_PFC_hifi", "flcount_HBCC_1325_PFC_hifi", "flcount_HBCC_1563_PFC_hifi", "flcount_HBCC_1615_PFC_hifi", "flcount_HBCC_1883_PFC_hifi", "flcount_HBCC_1927_PFC_hifi", "flcount_HBCC_2543_PFC_hifi", "flcount_HBCC_2587_PFC_hifi", "flcount_HBCC_846_PFC_hifi", "flcount_HBCC_894_PFC_hifi", "flcount_HBCC_910_PFC_hifi", "flcount_HBCC_977_PFC_hifi", "flcount_HSB_combined", "flcount_PFC.DP13_hifi", "flcount_PFC.DP15_hifi", "flcount_PFC.DP16_hifi", "flcount_SF1156_dACC", "flcount_SF1156_DLPFC", "flcount_SF1227_dACC_hifi", "flcount_SF1227_DLPFC_hifi", "flcount_SF1390_dACC", "flcount_SF1390_DLPFC", "flcount_SF2052_DLPFC_hifi", "flcount_SF2780_dACC", "flcount_SF2780_DLPFC", "flcount_SF2781_dACC_hifi", "flcount_SF2781_DLPFC", "flcount_SF2791_dACC", "flcount_SF2791_DLPFC")
+ratio$num_passed_sample_ctx=rowSums(ratio[, selected]>0.5)
+ratio$num_failed_sample_ctx=rowSums((ratio[, selected]>0)&(ratio[, selected]<=0.5))
+ratio$num_missing_sample_ctx=rowSums(ratio[, selected]==0)
+ratio$num_empty_sample_ctx=rowSums(ratio[, selected]==-1)
+
+#dACC sample
+selected=c("flcount_SF1156_dACC", "flcount_SF1227_dACC_hifi", "flcount_SF1390_dACC", "flcount_SF2780_dACC", "flcount_SF2781_dACC_hifi", "flcount_SF2791_dACC")
+ratio$num_passed_sample_dacc=rowSums(ratio[, selected]>0.5)
+ratio$num_failed_sample_dacc=rowSums((ratio[, selected]>0)&(ratio[, selected]<=0.5))
+ratio$num_missing_sample_dacc=rowSums(ratio[, selected]==0)
+ratio$num_empty_sample_dacc=rowSums(ratio[, selected]==-1)
+
+#HIPP sample
+selected=c("flcount_SF1156_Hippocampus", "flcount_SF1227_hippocampus_hifi", "flcount_SF2780_Hippocampus", "flcount_SF2781_Hippocampus", "flcount_SF2791_Hippocampus")
+ratio$num_passed_sample_hipp=rowSums(ratio[, selected]>0.5)
+ratio$num_failed_sample_hipp=rowSums((ratio[, selected]>0)&(ratio[, selected]<=0.5))
+ratio$num_missing_sample_hipp=rowSums(ratio[, selected]==0)
+ratio$num_empty_sample_hipp=rowSums(ratio[, selected]==-1)
+
+#PFC sample
+selected=c("flcount_CTL1_pool", "flcount_CTL2_pool", "flcount_FL_combined", "flcount_HBCC_1039_PFC_hifi", "flcount_HBCC_1051_PFC_hifi", "flcount_HBCC_1054_PFC_hifi", "flcount_HBCC_1150_PFC_hifi", "flcount_HBCC_1185_PFC_hifi", "flcount_HBCC_1275_PFC_hifi", "flcount_HBCC_1325_PFC_hifi", "flcount_HBCC_1563_PFC_hifi", "flcount_HBCC_1615_PFC_hifi", "flcount_HBCC_1883_PFC_hifi", "flcount_HBCC_1927_PFC_hifi", "flcount_HBCC_2543_PFC_hifi", "flcount_HBCC_2587_PFC_hifi", "flcount_HBCC_846_PFC_hifi", "flcount_HBCC_894_PFC_hifi", "flcount_HBCC_910_PFC_hifi", "flcount_HBCC_977_PFC_hifi", "flcount_HSB_combined", "flcount_PFC.DP13_hifi", "flcount_PFC.DP15_hifi", "flcount_PFC.DP16_hifi", "flcount_SF1156_DLPFC", "flcount_SF1227_DLPFC_hifi", "flcount_SF1390_DLPFC", "flcount_SF2052_DLPFC_hifi", "flcount_SF2780_DLPFC", "flcount_SF2781_DLPFC", "flcount_SF2791_DLPFC")
+ratio$num_passed_sample_pfc=rowSums(ratio[, selected]>0.5)
+ratio$num_failed_sample_pfc=rowSums((ratio[, selected]>0)&(ratio[, selected]<=0.5))
+ratio$num_missing_sample_pfc=rowSums(ratio[, selected]==0)
+ratio$num_empty_sample_pfc=rowSums(ratio[, selected]==-1)
+
+#Reconstructed loci gene ID
+write.table(ratio[(ratio$cluster_size==1)&(ratio$monoexonic==0)&(ratio$num_pc<2)&(ratio$num_passed_sample_all>25),]$gene_id, paste(args[1], "_reclocus_all_gene_id.txt", sep=""), sep="\n", col.names=FALSE, row.names=FALSE, quote=FALSE)
+write.table(ratio[(ratio$cluster_size==1)&(ratio$monoexonic==0)&(ratio$num_pc<2)&(ratio$num_passed_sample_cbl>3),]$gene_id, paste(args[1], "_reclocus_CBL_gene_id.txt", sep=""), sep="\n", col.names=FALSE, row.names=FALSE, quote=FALSE)
+write.table(ratio[(ratio$cluster_size==1)&(ratio$monoexonic==0)&(ratio$num_pc<2)&(ratio$num_passed_sample_ctx>18),]$gene_id, paste(args[1], "_reclocus_CTX_gene_id.txt", sep=""), sep="\n", col.names=FALSE, row.names=FALSE, quote=FALSE)
+write.table(ratio[(ratio$cluster_size==1)&(ratio$monoexonic==0)&(ratio$num_pc<2)&(ratio$num_passed_sample_dacc>3),]$gene_id, paste(args[1], "_reclocus_dACC_gene_id.txt", sep=""), sep="\n", col.names=FALSE, row.names=FALSE, quote=FALSE)
+write.table(ratio[(ratio$cluster_size==1)&(ratio$monoexonic==0)&(ratio$num_pc<2)&(ratio$num_passed_sample_hipp>2),]$gene_id, paste(args[1], "_reclocus_HIPP_gene_id.txt", sep=""), sep="\n", col.names=FALSE, row.names=FALSE, quote=FALSE)
+write.table(ratio[(ratio$cluster_size==1)&(ratio$monoexonic==0)&(ratio$num_pc<2)&(ratio$num_passed_sample_pfc>15),]$gene_id, paste(args[1], "_reclocus_PFC_gene_id.txt", sep=""), sep="\n", col.names=FALSE, row.names=FALSE, quote=FALSE)
