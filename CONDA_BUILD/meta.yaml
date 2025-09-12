@@ -1,5 +1,5 @@
 {% set name                = "isoPropeller" %}
-{% set version             = "1.8.3" %}
+{% set version             = "1.8.6" %}
 
 package:
   name: "{{ name|lower }}"
@@ -9,7 +9,7 @@ source:
   git_url: git@github.com:PintolabMSSM/{{ name }}.git
 
 build:
-  number: 5
+  number: 1
   noarch: generic
 
 requirements:
@@ -18,7 +18,7 @@ requirements:
     - perl-bioperl
     - perl-getopt-long
     - perl-list-moreutils
-    - samtools=1.11
+    - samtools
     - bedtools
     - htslib
   run:
@@ -26,7 +26,7 @@ requirements:
     - perl-bioperl
     - perl-getopt-long
     - perl-list-moreutils
-    - samtools=1.11
+    - samtools
     - bedtools
     - htslib
 

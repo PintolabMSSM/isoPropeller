@@ -22,6 +22,8 @@ use Bio::Seq;
 use Bio::SeqIO;
 use Benchmark qw(:hireswallclock);
 use threads;
+use Thread::Queue;
+use threads::shared;
 
 my $total_start_time = Benchmark->new;
 
@@ -35,6 +37,7 @@ my $usage="Usage: isoPropeller
 	-p <String> The prefix of gene and transcirpt IDs (Default: isoPropeller)
 	-q <Integer> Minimal mapping quality (Inclusive; default: $mapq)
 	-s <String> The path to samtools (samtools >= 1.11, default: \${PATH}/samtools)
+	-z <String> The path to tabix (Default: \${PATH}/tabix)
 	-t <Integer> The number of threads to use (Default: $num_thread)
 	-x <String> The gtf file specifying splice junctions used for correction. An optional attribute, depth, can be included.
 	-j <Boolean> The intervals of splice junctions specified by -x are introns. (Default: false for exons as input)
@@ -100,7 +103,7 @@ unless($bam && $out){
 
 if($junc_dist){
 	unless($junc){
-		print STDERR "<ERROR> Must specify -x with -d!\n$usage";
+		print STDERR "<ERROR> Must specify -junc with -junc_dist!\n$usage";
 		exit;
 	}
 }
@@ -278,28 +281,38 @@ $date = `date $date_format`;
 chomp $date;
 print $log_fh "[$date]\tPreprocessing done!\n";
 
-my $chr_pos = 0;
-my @thread = ();
-my @running = ();
+# Declare normal (non-shared) result hash
+my %read;
 
-while(@thread < @$chr_ref){
-	@running = threads->list(threads::running);
-	if(@running < $num_thread){
-		my $thread = threads->create(\&worker, $log_fh, $chr_ref->[$chr_pos], $dir, $mapq, $prefix, $min_junc_dist, $junc, $in_junc, $junc_dist, $end_dist, $polya, $genome, $window, $frac_a_min, $length_a_min, $fprime, $fprime_dist, $ipr, $stp);
-		push(@thread, $thread);
-		$chr_pos++;
-	}
+# Create a work queue from the list of chromosomes
+my $queue = Thread::Queue->new(@$chr_ref);
+
+# Launch fixed thread pool
+my @threads;
+for (1 .. $num_thread) {
+    push @threads, threads->create(sub {
+        while (defined(my $chr = $queue->dequeue_nb)) {
+            my $result_ref = worker(
+                $log_fh, $chr, $dir, $mapq, $prefix, $min_junc_dist,
+                $junc, $in_junc, $junc_dist, $end_dist, $polya, $genome,
+                $window, $frac_a_min, $length_a_min, $fprime, $fprime_dist,
+                $ipr, $stp
+            );
+
+            # Save result — no locking needed since each key is unique per thread
+            my ($chr_id, $read_hash_ref, $uncorrected_count) = @$result_ref;
+            $read{$chr_id} = [$read_hash_ref, $uncorrected_count];
+
+            # Log progress
+            my $date = `date +%F-%T.%3N`; chomp $date;
+            print $log_fh "[$date]\tFinished thread for $chr_id\n";
+        }
+    });
 }
 
-my %read = ();
+# Wait for all threads to complete
+$_->join for @threads;
 
-foreach my $thread (@thread){
-	my $result_ref = $thread->join();
-	@{$read{$result_ref->[0]}} = ($result_ref->[1], $result_ref->[2]);
-	$date = `date $date_format`;
-	chomp $date;
-	print $log_fh "[$date]\tJoined for $result_ref->[0]!\n";
-}
 
 system("cat ${dir}/*_out.gtf |  sort -k 1,1 -k 4,4n >> ${out}.gtf");
 $date = `date $date_format`;

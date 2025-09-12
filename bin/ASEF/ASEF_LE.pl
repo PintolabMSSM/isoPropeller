@@ -11,12 +11,13 @@ Change log:
 	v1.6	2023-12 Fixed an issue in parsing gtf attribute.
 	v1.7	2023-12	Added an option of TTS region to be used.
 	v1.8	2023-12	Fixed an issue in using bedtools closest by allowing all for tie.
+ 	v1.9	2025-08	Fixed a bug when handling the left position of input TTS bed file.
 =cut
 
 use strict;
 use Getopt::Long;
 
-my $version = "v1.8";
+my $version = "v1.9";
 
 my $usage = "Usage: perl ASEF_LE_${version}.pl
 	-q <String> .gtf of query
@@ -104,7 +105,7 @@ sub read_bed{
 			%{$temp_bed{$temp_line[3]}} = ();
 			$temp_bed{$temp_line[3]}{'chr'} = $temp_line[0];
 			$temp_bed{$temp_line[3]}{'strand'} = $temp_line[5];
-			$temp_bed{$temp_line[3]}{'left'} = $temp_line[1];
+			$temp_bed{$temp_line[3]}{'left'} = $temp_line[1] + 1;
 			$temp_bed{$temp_line[3]}{'right'} = $temp_line[2];
 		}
 	}
