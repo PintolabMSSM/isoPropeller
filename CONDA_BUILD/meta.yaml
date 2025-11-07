@@ -1,5 +1,5 @@
 {% set name                = "isoPropeller" %}
-{% set version             = "1.8.6" %}
+{% set version             = "1.9" %}
 
 package:
   name: "{{ name|lower }}"
@@ -18,7 +18,7 @@ requirements:
     - perl-bioperl
     - perl-getopt-long
     - perl-list-moreutils
-    - samtools
+    - samtools>=1.11
     - bedtools
     - htslib
   run:
@@ -26,7 +26,7 @@ requirements:
     - perl-bioperl
     - perl-getopt-long
     - perl-list-moreutils
-    - samtools
+    - samtools>=1.11
     - bedtools
     - htslib
 

@@ -1,0 +1,456 @@
+#!/usr/bin/env perl
+=start
+Author: ALin
+Purpose: To cluster TSSs of transcripts based on a specified size of window.
+Change log:
+	v1.2	2023-01	Added the output for TSS cluster specific splice junctions.
+	v1.3	2023-05 Added the number of transcripts per splice junction.
+	v1.4	2023-12 Added an option to use TSS region bed file. Fixed an issue of getting gtf attributes. Removed bedtools.
+	v1.5	2024-04	Fixed a bug in clustering TSS regions by taking the entire region of the current TSS cluster instead of the region of the current transcript.
+	v1.6	2024-08	Added outputs of TSS-SJ IDs for all first and last splice junctions.
+=cut
+
+use strict;
+use Getopt::Long;
+use threads;
+use Benchmark qw(:hireswallclock);
+
+my $version = "v1.6";
+
+my $usage = "Usage: perl isoPropeller_TSS_clustering_${version}.pl
+	-i <String> Input gtf file
+	-o <String> Output basename
+	-p <Integer> Window size (bp) for TSS clustering (Default: 100)
+	-e <String> TSS region bed
+	-t <Integer> Number of threads (Default: 1)
+	-h <Boolean> Help
+";
+
+my $total_start_time = Benchmark->new;
+
+my ($in, $out, $promoter, $tss_region, $num_thread, $help) = ("", "", 100, "", 1, 0);
+
+GetOptions(
+	'i=s'	=>	\$in,
+	'o=s'	=>	\$out,
+	'p=i'	=>	\$promoter,
+	'e=s'	=>	\$tss_region,
+	't=i'	=>	\$num_thread,
+	'h!'	=>	\$help
+);
+
+unless($in && $out){
+	print "$usage";
+	exit;
+}
+
+if($promoter < 0){
+	print "$usage";
+	exit;
+}
+
+if($tss_region){
+	unless(-e $tss_region){
+		print STDERR "<ERROR> $tss_region does not exist!\n";
+		exit;
+	}
+}
+
+open(my $log_fh, "> ${out}.log") or die "Cannot create ${out}.log!\n";
+
+my $dir = "${out}__isoPropeller_TSS_clustering_temp";
+if(-d $dir){
+	print STDERR "<ERROR> Temporary directory $dir exists! Re-writing the directory...\n";
+	system("rm ${dir}/*");
+}
+else{
+	system("mkdir $dir");
+}
+
+my $total_thread = `grep -c \"^processor\" /proc/cpuinfo`;
+chomp $total_thread;
+my $date_format = "+%F-%T.%3N";
+my $date = `date $date_format`;
+chomp $date;
+print $log_fh "[$date]\tA total of $total_thread threads detected\n";
+if($num_thread > $total_thread){
+	print STDERR "<WARNING> Exceeding the maximal total number of threads! Setting the number of thread to $total_thread...";
+	$num_thread = $total_thread;
+}
+
+my $start_time = Benchmark->new;
+$date = `date $date_format`;
+chomp $date;
+print $log_fh "[$date]\tStarting preprocessing...\n";
+system("grep \$\'\\t\'\"exon\"\$\'\\t\' $in > ${dir}/exon.gtf");
+my $chr_ref = split_gtf("${dir}/exon.gtf", $dir);
+if($tss_region){
+	split_bed($tss_region, $dir);
+}
+my $finish_time = Benchmark->new;
+my $time_spent = timediff($finish_time, $start_time);
+$date = `date $date_format`;
+chomp $date;
+print $log_fh "[$date]\tUsed ". timestr($time_spent) . " for preprocessing\n";
+
+my $chr_pos = 0;
+my @thread = ();
+my @running = ();
+
+while(@thread < @$chr_ref){
+	@running = threads->list(threads::running);
+	if(@running < $num_thread){
+		my $thread = threads->create(\&worker, $chr_ref->[$chr_pos], $promoter, $tss_region, $dir, $date_format, $log_fh);
+		push(@thread, $thread);
+		$chr_pos++;
+	}
+}
+
+foreach my $thread (@thread){
+	$thread->join();
+}
+
+system("cat ${dir}/*_tss_cluster.bed | sort -k 1,1 -k2,2n > ${out}.bed");
+system("echo \"tss_sj_id\"\$\'\\t\'\"transcript_id\" > ${out}_transcript.txt");
+system("cat ${dir}/*_transcript.txt | sort -k 1 >> ${out}_transcript.txt");
+system("echo \"sj_id\"\$\'\\t\'\"tss_id\"\$\'\\t\'\"num_tss\"\$\'\\t\'\"transcript_id\"\$\'\\t\'\"num_transcript\" > ${out}_per_sj.txt");
+system("cat ${dir}/*_per_sj.txt | sort -k 1 >> ${out}_per_sj.txt");
+system("echo \"tss_sj_id\" > ${out}_first_sj.txt");
+system("cat ${dir}/*_first_sj.txt >> ${out}_first_sj.txt");
+system("echo \"tss_sj_id\" > ${out}_last_sj.txt");
+system("cat ${dir}/*_last_sj.txt >> ${out}_last_sj.txt");
+
+system("rm -r ${dir}");
+
+my $total_finish_time = Benchmark->new;
+my $total_time_spent = timediff($total_finish_time, $total_start_time);
+$date = `date $date_format`;
+chomp $date;
+print $log_fh "[$date]\tTotal time used: ". timestr($total_time_spent) . "\n";
+close $log_fh;
+
+sub worker{
+	my ($temp_chr, $temp_promoter, $temp_tss_region, $temp_dir, $temp_date_format, $temp_log_fh) = @_;
+	my $temp_date = `date $temp_date_format`;
+	chomp $temp_date;
+	print $temp_log_fh "[$temp_date]\tStarting to process $temp_chr...\n";
+	my $temp_start_time = Benchmark->new;
+
+	my ($temp_tss_ref, $temp_transcript_ref) = read_gtf("${temp_dir}/${temp_chr}.gtf");
+	if($temp_tss_region){
+		read_bed($temp_tss_ref, "${temp_dir}/${temp_chr}_tss.bed");
+	}
+
+	my ($temp_tss_cluster_ref) = cluster_tss($temp_tss_ref, $temp_transcript_ref, $temp_promoter);
+
+	print_tss_cluster($temp_chr, $temp_tss_cluster_ref, "${temp_dir}/${temp_chr}_tss_cluster.bed", "${temp_dir}/${temp_chr}_transcript.txt", "${temp_dir}/${temp_chr}_per_sj.txt", "${temp_dir}/${temp_chr}_first_sj.txt", "${temp_dir}/${temp_chr}_last_sj.txt");
+
+	my $temp_finish_time = Benchmark->new;
+	my $temp_time_spent = timediff($temp_finish_time, $temp_start_time);
+	$temp_date = `date $temp_date_format`;
+	chomp $temp_date;
+	print $temp_log_fh "[$temp_date]\tDone for $temp_chr in " . timestr($temp_time_spent) , "!\n";
+
+	return 1;
+}
+
+#Split gtf 
+sub split_gtf{
+	my ($temp_gtf, $temp_dir) = @_;
+	my $temp_fh;
+	system("cut -f1 $temp_gtf | sort | uniq > ${temp_dir}/chr_list.txt");
+	my @temp_chr = ();
+	open($temp_fh, "${temp_dir}/chr_list.txt") or die "Cannot open ${temp_dir}/chr_list.txt!\n";
+	while(<$temp_fh>){
+		chomp;
+		my $temp_line = $_;
+		$temp_line =~ s/\r//;
+		push(@temp_chr, $temp_line);
+	}
+	close $temp_fh;
+	system("for i in `cat ${temp_dir}/chr_list.txt`; do grep \"^\$i\"\$\'\\t\' $temp_gtf > ${temp_dir}/\$\{i\}.gtf; done");
+
+	return \@temp_chr;
+}
+
+#Split bed file
+sub split_bed{
+	my ($temp_bed, $temp_dir) = @_;
+	system("for i in `cat ${temp_dir}/chr_list.txt`; do grep \"^\$i\"\$\'\\t\' $temp_bed > ${temp_dir}/\$\{i\}_tss.bed; done");
+
+	return 1;
+}
+
+#Load bed file
+sub read_bed{
+	my ($temp_tss_ref, $temp_bed) = @_;
+	open(my $temp_fh, $temp_bed) or die "Cannot open $temp_bed!\n";
+	while(<$temp_fh>){
+		chomp;
+		my $temp_line = $_;
+		$temp_line =~ s/\r//;
+		my @temp_line = split('\t', $temp_line);
+		if(exists $temp_tss_ref->{$temp_line[5]}{$temp_line[3]}){
+			$temp_tss_ref->{$temp_line[5]}{$temp_line[3]}{'left'} = $temp_line[1];
+			$temp_tss_ref->{$temp_line[5]}{$temp_line[3]}{'right'} = $temp_line[2];
+		}
+	}
+	close $temp_fh;
+
+	return 1;
+}
+
+#Load annotation
+sub read_gtf{
+	my ($temp_gtf) = @_;
+	my %temp_tss = ();
+	my %temp_transcript = ();
+	open(my $temp_fh, "sort -k 1,1 -k 4,4n $temp_gtf |") or die "Cannot open $temp_gtf!\n";
+	while(<$temp_fh>){
+		chomp;
+		my $temp_line = $_;
+		my @temp_line = split('\t', $temp_line);
+		if($temp_line[2] ne 'exon'){
+			next;
+		}
+		my $temp_num_col = @temp_line;
+		if($temp_num_col != 9){
+			print STDERR"<ERROR> $temp_line\nThe number of columns does not match the gtf format.\n";
+			exit;
+		}
+		my $temp_transcript_id;
+		if($temp_line[8] =~ /(^|\s)transcript_id \"([^\"]+)\"\;/){
+			$temp_transcript_id = $2;
+		}
+		else{
+			print STDERR "<ERROR> Cannot find transcript ID at line:\n$temp_line\n";
+			exit;
+		}
+		my $temp_gene_id;
+		if($temp_line[8] =~ /(^|\s)gene_id \"([^\"]+)\"\;/){
+			$temp_gene_id = $2;
+		}
+		else{
+			print STDERR "<ERROR> Cannot find gene ID at line:\n$temp_line\n";
+			exit;
+		}
+		my $temp_gene_type;
+		if($temp_line[8] =~ /(^|\s)gene_type \"([^\"]+)\"\;/){
+			$temp_gene_type = $2;
+		}
+		my $temp_gene_name;
+		if($temp_line[8] =~ /(^|\s)gene_name \"([^\"]+)\"\;/){
+			$temp_gene_name = $2;
+		}
+		unless(exists $temp_tss{$temp_line[6]}){
+			%{$temp_tss{$temp_line[6]}} = ();
+		}
+		unless(exists $temp_tss{$temp_line[6]}{$temp_transcript_id}){
+			%{$temp_tss{$temp_line[6]}{$temp_transcript_id}} = ();
+			$temp_tss{$temp_line[6]}{$temp_transcript_id}{'gene_id'} = $temp_gene_id;
+			$temp_tss{$temp_line[6]}{$temp_transcript_id}{'gene_type'} = $temp_gene_type;
+			$temp_tss{$temp_line[6]}{$temp_transcript_id}{'gene_name'} = $temp_gene_name;
+			if($temp_line[6] eq "-"){
+				$temp_tss{$temp_line[6]}{$temp_transcript_id}{'left'} = $temp_line[4];
+				$temp_tss{$temp_line[6]}{$temp_transcript_id}{'right'} = $temp_line[4];
+			}
+			else{
+				$temp_tss{$temp_line[6]}{$temp_transcript_id}{'left'} = $temp_line[3];
+				$temp_tss{$temp_line[6]}{$temp_transcript_id}{'right'} = $temp_line[3];
+			}
+		}
+		if($temp_line[6] eq "-"){
+			if($temp_line[4] > $temp_tss{$temp_line[6]}{$temp_transcript_id}{'left'}){
+				$temp_tss{$temp_line[6]}{$temp_transcript_id}{'left'} = $temp_line[4];
+				$temp_tss{$temp_line[6]}{$temp_transcript_id}{'right'} = $temp_line[4];
+			}
+		}
+		else{
+			if($temp_line[3] < $temp_tss{$temp_line[6]}{$temp_transcript_id}{'left'}){
+				$temp_tss{$temp_line[6]}{$temp_transcript_id}{'left'} = $temp_line[3];
+				$temp_tss{$temp_line[6]}{$temp_transcript_id}{'right'} = $temp_line[3];
+			}
+		}
+		unless(exists $temp_transcript{$temp_transcript_id}){
+			%{$temp_transcript{$temp_transcript_id}} = ();
+			$temp_transcript{$temp_transcript_id}{'strand'} = $temp_line[6];
+			@{$temp_transcript{$temp_transcript_id}{'exon'}} = ();
+		}
+		my @temp_exon = ($temp_line[3], $temp_line[4]);
+		push(@{$temp_transcript{$temp_transcript_id}{'exon'}}, \@temp_exon);
+	}
+	close $temp_fh;
+	
+	return (\%temp_tss, \%temp_transcript);
+}
+
+#Cluster TSS
+sub cluster_tss{
+	my ($temp_tss_ref, $temp_transcript_ref, $temp_promoter) = @_;
+	my %temp_tss_cluster = ();
+	foreach my $temp_strand (keys %$temp_tss_ref){
+		unless(exists $temp_tss_cluster{$temp_strand}){
+			%{$temp_tss_cluster{$temp_strand}} = ();
+		}
+		my $temp_cluster = 0;
+		my ($temp_last_tss_left, $temp_last_tss_right);
+		foreach my $temp_transcript_id (sort {
+			($temp_tss_ref->{$temp_strand}{$a}{'left'} <=> $temp_tss_ref->{$temp_strand}{$b}{'left'}) || 
+			($temp_tss_ref->{$temp_strand}{$a}{'right'} <=> $temp_tss_ref->{$temp_strand}{$b}{'right'})
+			} keys %{$temp_tss_ref->{$temp_strand}}){
+			my $temp_gene_id = $temp_tss_ref->{$temp_strand}{$temp_transcript_id}{'gene_id'};
+			my $temp_tss_left = $temp_tss_ref->{$temp_strand}{$temp_transcript_id}{'left'};
+			my $temp_tss_right = $temp_tss_ref->{$temp_strand}{$temp_transcript_id}{'right'};
+			#print "$temp_transcript_id\t$temp_gene_id\t$temp_tss_left\t$temp_tss_right\nLast:$temp_last_tss_left\t$temp_last_tss_right\n";
+			if((!(defined $temp_last_tss_right)) || (($temp_tss_left - $temp_last_tss_right) >= $temp_promoter)){
+				$temp_cluster++;
+				%{$temp_tss_cluster{$temp_strand}{$temp_cluster}} = ();
+				$temp_tss_cluster{$temp_strand}{$temp_cluster}{'left'} = $temp_tss_left;
+				$temp_tss_cluster{$temp_strand}{$temp_cluster}{'right'} = $temp_tss_right;
+				%{$temp_tss_cluster{$temp_strand}{$temp_cluster}{'gene_id'}} = ();
+				%{$temp_tss_cluster{$temp_strand}{$temp_cluster}{'sj_id'}} = ();
+				%{$temp_tss_cluster{$temp_strand}{$temp_cluster}{'first_sj_id'}} = ();
+				%{$temp_tss_cluster{$temp_strand}{$temp_cluster}{'last_sj_id'}} = ();
+				#print "New cluster $temp_cluster\n";
+			}
+			else{
+				#print "Added to cluster $temp_cluster\n";
+				if($temp_tss_right > $temp_tss_cluster{$temp_strand}{$temp_cluster}{'right'}){
+					$temp_tss_cluster{$temp_strand}{$temp_cluster}{'right'} = $temp_tss_right;
+				}
+			}
+			unless(exists $temp_tss_cluster{$temp_strand}{$temp_cluster}{'gene_id'}{$temp_gene_id}){
+				%{$temp_tss_cluster{$temp_strand}{$temp_cluster}{'gene_id'}{$temp_gene_id}} = ();
+				$temp_tss_cluster{$temp_strand}{$temp_cluster}{'gene_id'}{$temp_gene_id}{'gene_type'} = $temp_tss_ref->{$temp_strand}{$temp_transcript_id}{'gene_type'};
+				$temp_tss_cluster{$temp_strand}{$temp_cluster}{'gene_id'}{$temp_gene_id}{'gene_name'} = $temp_tss_ref->{$temp_strand}{$temp_transcript_id}{'gene_name'};
+				@{$temp_tss_cluster{$temp_strand}{$temp_cluster}{'gene_id'}{$temp_gene_id}{'transcript_id'}} = ();
+			}
+			push(@{$temp_tss_cluster{$temp_strand}{$temp_cluster}{'gene_id'}{$temp_gene_id}{'transcript_id'}}, $temp_transcript_id);
+			if(@{$temp_transcript_ref->{$temp_transcript_id}{'exon'}} == 1){
+				unless(exists $temp_tss_cluster{$temp_strand}{$temp_cluster}{'sj_id'}{'monoexonic'}){
+					%{$temp_tss_cluster{$temp_strand}{$temp_cluster}{'sj_id'}{'monoexonic'}} = ();
+					@{$temp_tss_cluster{$temp_strand}{$temp_cluster}{'sj_id'}{'monoexonic'}{'transcript_id'}} = ();
+				}
+				push(@{$temp_tss_cluster{$temp_strand}{$temp_cluster}{'sj_id'}{'monoexonic'}{'transcript_id'}}, $temp_transcript_id);
+			}
+			else{
+				for(my $i = 0; $i < (@{$temp_transcript_ref->{$temp_transcript_id}{'exon'}} - 1); $i++){
+					my $temp_sj_id = "$temp_transcript_ref->{$temp_transcript_id}{'exon'}->[$i][1]_$temp_transcript_ref->{$temp_transcript_id}{'exon'}->[$i+1][0]";
+					unless(exists $temp_tss_cluster{$temp_strand}{$temp_cluster}{'sj_id'}{$temp_sj_id}){
+						%{$temp_tss_cluster{$temp_strand}{$temp_cluster}{'sj_id'}{$temp_sj_id}} = ();
+						@{$temp_tss_cluster{$temp_strand}{$temp_cluster}{'sj_id'}{$temp_sj_id}{'transcript_id'}} = ();
+					}
+					push(@{$temp_tss_cluster{$temp_strand}{$temp_cluster}{'sj_id'}{$temp_sj_id}{'transcript_id'}}, $temp_transcript_id);
+					if($i == 0){
+						if($temp_strand eq '-'){
+							unless(exists $temp_tss_cluster{$temp_strand}{$temp_cluster}{'last_sj_id'}{$temp_sj_id}){
+								$temp_tss_cluster{$temp_strand}{$temp_cluster}{'last_sj_id'}{$temp_sj_id} = 1;
+							}
+						}
+						else{
+							unless(exists $temp_tss_cluster{$temp_strand}{$temp_cluster}{'first_sj_id'}{$temp_sj_id}){
+								$temp_tss_cluster{$temp_strand}{$temp_cluster}{'first_sj_id'}{$temp_sj_id} = 1;
+							}
+						}
+					}
+					if($i == (@{$temp_transcript_ref->{$temp_transcript_id}{'exon'}} - 2)){
+						if($temp_strand eq '-'){
+							unless(exists $temp_tss_cluster{$temp_strand}{$temp_cluster}{'first_sj_id'}{$temp_sj_id}){
+								$temp_tss_cluster{$temp_strand}{$temp_cluster}{'first_sj_id'}{$temp_sj_id} = 1;
+							}
+						}
+						else{
+							unless(exists $temp_tss_cluster{$temp_strand}{$temp_cluster}{'last_sj_id'}{$temp_sj_id}){
+								$temp_tss_cluster{$temp_strand}{$temp_cluster}{'last_sj_id'}{$temp_sj_id} = 1;
+							}
+						}
+					}
+				}
+			}
+			($temp_last_tss_left, $temp_last_tss_right) = ($temp_tss_cluster{$temp_strand}{$temp_cluster}{'left'}, $temp_tss_cluster{$temp_strand}{$temp_cluster}{'right'});
+		}
+	}
+
+	return (\%temp_tss_cluster);
+}
+
+#Print TSS cluster
+sub print_tss_cluster{
+	my ($temp_chr, $temp_tss_cluster_ref, $temp_tss_out, $temp_transcript_out, $temp_per_sj_out, $temp_first_sj_out, $temp_last_sj_out) = @_;
+	open(my $temp_tss_fh, "> $temp_tss_out") or die "Cannot create $temp_tss_out!\n";
+	open(my $temp_transcript_fh, "> $temp_transcript_out") or die "Cannot create $temp_transcript_out!\n";
+	open(my $temp_per_sj_fh, "> $temp_per_sj_out") or die "Cannot create $temp_per_sj_out!\n";
+	open(my $temp_first_sj_fh, "> $temp_first_sj_out") or die "Cannot create $temp_first_sj_out!\n";
+	open(my $temp_last_sj_fh, "> $temp_last_sj_out") or die "Cannot create $temp_last_sj_out!\n";
+	foreach my $temp_strand (keys %$temp_tss_cluster_ref){
+		my %temp_sj = ();
+		foreach my $temp_cluster (sort {$a <=> $b} keys %{$temp_tss_cluster_ref->{$temp_strand}}){
+			print $temp_tss_fh "$temp_chr\t$temp_tss_cluster_ref->{$temp_strand}{$temp_cluster}{'left'}\t$temp_tss_cluster_ref->{$temp_strand}{$temp_cluster}{'right'}\t${temp_chr}_$temp_tss_cluster_ref->{$temp_strand}{$temp_cluster}{'left'}_$temp_tss_cluster_ref->{$temp_strand}{$temp_cluster}{'right'}_${temp_strand}\t0\t$temp_strand\t";
+			my @temp_gene_id = ();
+			my @temp_gene_type = ();
+			my @temp_gene_name = ();
+			my @temp_transcript_id = ();
+			my $temp_num_gene = 0;
+			my $temp_num_transcript = 0;
+			foreach my $temp_gene_id (keys %{$temp_tss_cluster_ref->{$temp_strand}{$temp_cluster}{'gene_id'}}){
+				push(@temp_gene_id, $temp_gene_id);
+				$temp_num_gene++;
+				push(@temp_gene_type, $temp_tss_cluster_ref->{$temp_strand}{$temp_cluster}{'gene_id'}{$temp_gene_id}{'gene_type'});
+				push(@temp_gene_name, $temp_tss_cluster_ref->{$temp_strand}{$temp_cluster}{'gene_id'}{$temp_gene_id}{'gene_name'});
+				my $temp_transcript_id = join(",", @{$temp_tss_cluster_ref->{$temp_strand}{$temp_cluster}{'gene_id'}{$temp_gene_id}{'transcript_id'}});
+				push(@temp_transcript_id, $temp_transcript_id);
+				$temp_num_transcript += @{$temp_tss_cluster_ref->{$temp_strand}{$temp_cluster}{'gene_id'}{$temp_gene_id}{'transcript_id'}};
+			}
+			my $temp_gene_id = join(";", @temp_gene_id);
+			my $temp_gene_type = join(";", @temp_gene_type);
+			my $temp_gene_name = join(";", @temp_gene_name);
+			my $temp_transcript_id = join(";", @temp_transcript_id);
+			print $temp_tss_fh "$temp_gene_id\t$temp_num_gene\t$temp_transcript_id\t$temp_num_transcript\t$temp_gene_type\t$temp_gene_name\n";
+			foreach my $temp_sj_id (sort {$a <=> $b} keys %{$temp_tss_cluster_ref->{$temp_strand}{$temp_cluster}{'sj_id'}}){
+				my $temp_transcript_id = join(",", @{$temp_tss_cluster_ref->{$temp_strand}{$temp_cluster}{'sj_id'}{$temp_sj_id}{'transcript_id'}});
+				print $temp_transcript_fh "${temp_chr}_$temp_tss_cluster_ref->{$temp_strand}{$temp_cluster}{'left'}_$temp_tss_cluster_ref->{$temp_strand}{$temp_cluster}{'right'}_${temp_strand}_${temp_sj_id}\t$temp_transcript_id\n";
+				unless(exists $temp_sj{$temp_sj_id}){
+					%{$temp_sj{$temp_sj_id}} = ();
+				}
+				my $temp_tss_id = "${temp_chr}_$temp_tss_cluster_ref->{$temp_strand}{$temp_cluster}{'left'}_$temp_tss_cluster_ref->{$temp_strand}{$temp_cluster}{'right'}_${temp_strand}";
+				unless(exists $temp_sj{$temp_sj_id}{$temp_tss_id}){
+					@{$temp_sj{$temp_sj_id}{$temp_tss_id}} = ();
+				}
+				push(@{$temp_sj{$temp_sj_id}{$temp_tss_id}}, @{$temp_tss_cluster_ref->{$temp_strand}{$temp_cluster}{'sj_id'}{$temp_sj_id}{'transcript_id'}});
+			}
+			foreach my $temp_first_sj_id (keys %{$temp_tss_cluster_ref->{$temp_strand}{$temp_cluster}{'first_sj_id'}}){
+				print $temp_first_sj_fh "${temp_chr}_$temp_tss_cluster_ref->{$temp_strand}{$temp_cluster}{'left'}_$temp_tss_cluster_ref->{$temp_strand}{$temp_cluster}{'right'}_${temp_strand}_${temp_first_sj_id}\n";
+			}
+			foreach my $temp_last_sj_id (keys %{$temp_tss_cluster_ref->{$temp_strand}{$temp_cluster}{'last_sj_id'}}){
+				print $temp_last_sj_fh "${temp_chr}_$temp_tss_cluster_ref->{$temp_strand}{$temp_cluster}{'left'}_$temp_tss_cluster_ref->{$temp_strand}{$temp_cluster}{'right'}_${temp_strand}_${temp_last_sj_id}\n";
+			}
+		}
+		SJ:foreach my $temp_sj_id (keys %temp_sj){
+			if($temp_sj_id =~ /monoexonic/){
+				next SJ;
+			}
+			my @temp_tss_id = sort {$a <=> $b} keys %{$temp_sj{$temp_sj_id}};
+			my $temp_tss_id = join(",", @temp_tss_id);
+			my $temp_num_tss = @temp_tss_id;
+			my $temp_num_transcript = 0;
+			my @temp_transcript_id = ();
+			foreach my $temp_tss_id_sub (@temp_tss_id){
+				my $temp_transcript_id = join(",", @{$temp_sj{$temp_sj_id}{$temp_tss_id_sub}});
+				push(@temp_transcript_id, $temp_transcript_id);
+				$temp_num_transcript += @{$temp_sj{$temp_sj_id}{$temp_tss_id_sub}};
+			}
+			my $temp_transcript_id = join(";", @temp_transcript_id);
+			print $temp_per_sj_fh "${temp_chr}_${temp_sj_id}_${temp_strand}\t$temp_tss_id\t$temp_num_tss\t$temp_transcript_id\t$temp_num_transcript\n";
+		}
+	}
+	close $temp_tss_fh;
+	close $temp_transcript_fh;
+	close $temp_per_sj_fh;
+	close $temp_first_sj_fh;
+	close $temp_last_sj_fh;
+
+	return 1;
+}
+
+
+

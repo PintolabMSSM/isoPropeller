@@ -1,0 +1,197 @@
+#!/usr/bin/env perl
+#Author: ALin
+#Purpose: Convert an exon gtf to an intron gtf.
+#Change log
+#	v1.1	2021-04	It is the same as exon2intron_gtf_v1.2.pl.
+#	v1.2	2022-04	Added the transcript IDs to the intron.
+#	v1.3	2022-09	Changed code structure.
+#	v1.4	2022-09	Added information of whether an intron is the first, internal, or last one in the ID output file.
+
+use strict;
+use Getopt::Long;
+
+my $version = "v1.4";
+
+my $usage = "Usage: perl isoPropeller_exon2intron_${version}.pl
+	-i <String> Input exon gtf
+	-o <String> Basename of output files
+	-b <String> The path to bedtools
+";
+
+my ($in, $out, $btp, $help) = ("", "", "", 0);
+
+GetOptions(
+	'i=s'	=>	\$in,
+	'o=s'	=>	\$out,
+	'b=s'	=>	\$btp,
+        'h!'    =>      \$help,
+);
+
+if($help){
+	print "$usage";
+	exit;
+}
+
+unless($btp){
+	$btp = "bedtools";
+}
+
+unless(`$btp`){
+	print "Incorrect path for bedtools!\n";
+	print "$usage";
+	exit;
+}
+
+
+unless($in && $out){
+	print "$usage";
+	exit;
+}
+
+my $exon_ref = read_gtf($in);
+
+parse_print_intron($exon_ref, $version, $in, $out, $btp);
+
+sub read_gtf{
+	my ($temp_in) = @_;
+	my %temp_exon = ();
+	my $temp_fh;
+	open($temp_fh, $temp_in) or die "<ERROR> Cannot open $temp_in!\n";
+	while(<$temp_fh>){
+		chomp;
+		my $temp_line = $_;
+		$temp_line =~ s/\r//;
+		if($temp_line =~ /^#/){
+			next;
+		}
+		my @temp_line = split('\t', $temp_line);
+		if(@temp_line != 9){
+			print STDERR "<ERROR> $temp_in doesn't seem to be a .gtf file. Please check.\n";
+			exit;
+		}
+		if($temp_line[2] ne "exon"){
+			next;
+		}
+		if($temp_line[6] eq "."){
+			print STDERR "<ERROR> Strand unknown at line\n$temp_line\n";
+			exit;
+		}
+		my ($temp_gene_id, $temp_transcript_id, $temp_gene_name, $temp_gene_type);
+		if($temp_line[8] =~ /gene_id \"([^\"]+)\"/){
+			$temp_gene_id = $1;
+		}
+		else{
+			print STDERR "<ERROR> gene_id is missing at line\n$temp_line\n";
+			exit;
+		}
+		if($temp_line[8] =~ /transcript_id \"([^\"]+)\"/){
+			$temp_transcript_id = $1;
+		}
+		else{
+			print STDERR "<ERROR> transcript_id is missing at line\n$temp_line\n";
+			exit;
+		}
+		#if($temp_line[8] =~ /gene_name \"([^\"]+)\"/){
+			#$temp_gene_name = $1;
+		#}
+		#if($line[8] =~ /gene_[^\"]*type \"([^\"]+)\"/){
+			#$temp_gene_type = $1;
+		#}
+		unless(exists $temp_exon{$temp_gene_id}){
+			%{$temp_exon{$temp_gene_id}} = ();
+			$temp_exon{$temp_gene_id}{'chr'} = $temp_line[0];
+			#$temp_exon{$temp_gene_id}{'gene_name'} = $temp_gene_name;
+			#$temp_exon{$temp_gene_id}{'gene_type'} = $temp_gene_type;
+			$temp_exon{$temp_gene_id}{'strand'} = $temp_line[6];
+			%{$temp_exon{$temp_gene_id}{'transcript_id'}} = ();
+		}
+		unless(exists $temp_exon{$temp_gene_id}{'transcript_id'}{$temp_transcript_id}){
+			@{$temp_exon{$temp_gene_id}{'transcript_id'}{$temp_transcript_id}} = ();
+		}
+		my @temp_exon = ($temp_line[3], $temp_line[4]);
+		push(@{$temp_exon{$temp_gene_id}{'transcript_id'}{$temp_transcript_id}}, \@temp_exon);
+	}
+	close $temp_fh;
+
+	return \%temp_exon;
+}
+
+sub parse_print_intron{
+	my ($temp_exon_ref, $temp_version, $temp_in, $temp_out, $temp_btp) = @_;
+	my %temp_intron = ();
+	my ($temp_gtf_fh, $temp_id_fh);
+	open($temp_gtf_fh, "> ${temp_out}.gtf") or die "Cannot create ${temp_out}.gtf!\n";
+	open($temp_id_fh, "> ${temp_out}_id.txt") or die "Cannot create ${temp_out}_id.txt!\n";
+	print $temp_gtf_fh "#perl isoPropeller_exon2intron_${temp_version}.pl -i $temp_in -o $temp_out -b $temp_btp\n";
+	print $temp_id_fh "intron_id\tintron_type\ttranscript_id\n";
+	close $temp_gtf_fh;
+	open($temp_gtf_fh, "| $temp_btp sort >> ${temp_out}.gtf") or die "Cannot create ${temp_out}.gtf!\n";
+	foreach my $temp_gene_id (keys %$temp_exon_ref){
+		TRANSCRIPT:foreach my $temp_transcript_id (keys %{$temp_exon_ref->{$temp_gene_id}->{'transcript_id'}}){
+			my $temp_num_exon = @{$temp_exon_ref->{$temp_gene_id}->{'transcript_id'}->{$temp_transcript_id}};
+			if($temp_num_exon == 1){
+				next TRANSCRIPT;
+			}
+			my @temp_sorted_exon = sort {$a->[0] <=> $b->[0]} @{$temp_exon_ref->{$temp_gene_id}{'transcript_id'}{$temp_transcript_id}};
+			for(my $i = 0; $i < $temp_num_exon - 1; $i++){
+				my $temp_left = $temp_sorted_exon[$i][1] + 1;
+				my $temp_right = $temp_sorted_exon[$i+1][0] - 1;
+				my $temp_intron_id = "$temp_exon_ref->{$temp_gene_id}{'chr'}_${temp_left}_${temp_right}_$temp_exon_ref->{$temp_gene_id}{'strand'}";
+				unless(exists $temp_intron{$temp_intron_id}){
+					%{$temp_intron{$temp_intron_id}} = ();
+					print $temp_gtf_fh "$temp_exon_ref->{$temp_gene_id}->{'chr'}\tisoPropeller\tintron\t$temp_left\t$temp_right\t.\t$temp_exon_ref->{$temp_gene_id}->{'strand'}\t.\tintron_id \"$temp_intron_id\"\;\n"
+				}
+				if($i == 0){
+					my $temp_type = "first";
+					if($temp_exon_ref->{$temp_gene_id}{'strand'} eq "-"){
+						$temp_type = "last";
+					}
+					unless(exists $temp_intron{$temp_intron_id}{$temp_type}){
+						%{$temp_intron{$temp_intron_id}{$temp_type}} = ();
+					}
+					unless(exists $temp_intron{$temp_intron_id}{$temp_type}{$temp_transcript_id}){
+						$temp_intron{$temp_intron_id}{$temp_type}{$temp_transcript_id} = 1;
+					}
+				}
+				if($i == ($temp_num_exon - 2)){
+					my $temp_type = "last";
+					if($temp_exon_ref->{$temp_gene_id}{'strand'} eq "-"){
+						$temp_type = "first";
+					}
+					unless(exists $temp_intron{$temp_intron_id}{$temp_type}){
+						%{$temp_intron{$temp_intron_id}{$temp_type}} = ();
+					}
+					unless(exists $temp_intron{$temp_intron_id}{$temp_type}{$temp_transcript_id}){
+						$temp_intron{$temp_intron_id}{$temp_type}{$temp_transcript_id} = 1;
+					}
+				}
+				if(($i != 0) && ($i != ($temp_num_exon - 2))){
+					my $temp_type = "internal";
+					unless(exists $temp_intron{$temp_intron_id}{$temp_type}){
+						%{$temp_intron{$temp_intron_id}{$temp_type}} = ();
+					}
+					unless(exists $temp_intron{$temp_intron_id}{$temp_type}{$temp_transcript_id}){
+						$temp_intron{$temp_intron_id}{$temp_type}{$temp_transcript_id} = 1;
+					}
+				}
+			}
+		}
+	}
+	
+	foreach my $temp_intron_id (keys %temp_intron){
+			foreach my $temp_type (keys %{$temp_intron{$temp_intron_id}}){
+				my $temp_transcript_id = join(",", keys %{$temp_intron{$temp_intron_id}{$temp_type}});
+				print $temp_id_fh "$temp_intron_id\t$temp_type\t$temp_transcript_id\n";
+			}
+	}
+	close $temp_gtf_fh;
+	close $temp_id_fh;
+
+	return 1;
+}
+
+
+
+
+
+

@@ -1,0 +1,373 @@
+#!/usr/bin/env perl
+=start
+Author: ALin
+Purpose: To update gtf ends based on the output with the most read supports from isoPropeller_quantification_TSS/TTS_vx.pl.
+Change log:
+=cut
+
+use strict;
+use Getopt::Long;
+use threads;
+use Benchmark qw(:hireswallclock);
+use List::Util qw(sum);
+
+my $total_start_time = Benchmark->new;
+
+my $version = 'v1.1';
+
+my ($in, $out, $tss, $tts, $num_thread, $help) = ('', '', '', '', 1, 0);
+
+my $usage = "Usage: perl isoPropeller_end_update.pl
+	-i <String> Input gtf file
+	-o <String> Output gtf file
+	-a <String> TSS quantification file
+	-b <String> TTS quantification file
+	-t <Integer> The number of threads to use (Default: $num_thread)
+	-h <Boolean> Help
+";
+
+GetOptions(
+	'i=s'	=>	\$in,
+	'o=s'	=>	\$out,
+	'a=s'	=>	\$tss,
+	'b=s'	=>	\$tts,
+	't=i'	=>	\$num_thread,
+	'h!'	=>	\$help,
+);
+
+if($help){
+        print "$usage";
+        exit;
+}
+
+unless(-e $in){
+	print STDERR "<ERROR> .gtf file, $in, does not exist!\n$usage";
+	exit;
+}
+
+unless($out){
+	print STDERR "<ERROR> Output file missing!\n$usage";
+	exit;
+}
+
+unless(-e $tss){
+	print STDERR "<ERROR> TSS quantification file, $tss, does not exist!\n$usage";
+	exit;
+}
+
+unless(-e $tts){
+	print STDERR "<ERROR> TTS quantification file, $tts, does not exist!\n$usage";
+	exit;
+}
+
+my $date_format = "+%F-%T.%3N";
+my $date = `date $date_format`;
+chomp $date;
+print "[$date]\tperl isoPropeller_end_update_${version}.pl -i $in -o $out -a $tss -b $tts -t $num_thread\n";
+open(my $fh, "> $out") or die "Cannot create $out!\n";
+print $fh "#perl isoPropeller_end_update_${version}.pl -i $in -o $out -a $tss -b $tts -t $num_thread\n";
+close $fh;
+
+my $dir = "${out}__isoPropeller_end_update_temp";
+if(-d $dir){
+	print STDERR "<WARNNING> Temporary directory $dir exists! Will overwrite it...\n";
+	system("rm ${dir}/*");
+}
+else{
+	system("mkdir $dir");
+}
+
+my $total_thread = `grep -c \"^processor\" /proc/cpuinfo`;
+chomp $total_thread;
+$date = `date $date_format`;
+chomp $date;
+print "[$date]\tA total of $total_thread threads detected\n";
+if($num_thread > $total_thread){
+	print STDERR "<WARNING> Exceeding the maximal total number of threads! Setting the number of thread to $total_thread...\n";
+	$num_thread = $total_thread;
+}
+
+my $start_time = Benchmark->new;
+$date = `date $date_format`;
+chomp $date;
+print "[$date]\tStarting preprocessing...\n";
+my $chr_ref = split_chromosome($dir, $in, $tss, $tts);
+my $finish_time = Benchmark->new;
+my $time_spent = timediff($finish_time, $start_time);
+$date = `date $date_format`;
+chomp $date;
+print "[$date]\tUsed ". timestr($time_spent) . " for preprocessing\n";
+
+my $chr_pos = 0;
+my @thread = ();
+my @running = ();
+
+while(@thread < @$chr_ref){
+	@running = threads->list(threads::running);
+	if(@running < $num_thread){
+		my $thread = threads->create(\&worker, $chr_ref->[$chr_pos], $dir, $date_format);
+		push(@thread, $thread);
+		$chr_pos++;
+	}
+}
+
+foreach my $thread (@thread){
+	my @result = $thread->join();
+	$date = `date $date_format`;
+	chomp $date;
+	print "[$date]\tJoined for $result[0]!\n";
+}
+
+system("cat ${dir}/*_out.gtf | sort -k 1,1 -k 4,4n >> $out");
+
+$date = `date $date_format`;
+chomp $date;
+print "[$date]\tGenerated output files!\n";
+system("rm -r ${dir}");
+$date = `date $date_format`;
+chomp $date;
+print "[$date]\tCleaned temporary files!\n";
+
+my $total_finish_time = Benchmark->new;
+my $total_time_spent = timediff($total_finish_time, $total_start_time);
+$date = `date $date_format`;
+chomp $date;
+print "[$date]\tTotal time used: ". timestr($total_time_spent) . "\n";
+
+sub worker{
+	my ($temp_chr, $temp_dir, $temp_date_format) = @_;
+	my $temp_date = `date $temp_date_format`;
+	chomp $temp_date;
+	print "[$temp_date]\tStarting to process $temp_chr...\n";
+	my $temp_start_time = Benchmark->new;
+	my %temp_tss_tts = ();
+	read_tss_tts(\%temp_tss_tts, "${temp_dir}/${temp_chr}_tss.txt", 'tss');
+	read_tss_tts(\%temp_tss_tts, "${temp_dir}/${temp_chr}_tts.txt", 'tts');
+	my $temp_transcript_ref = read_gtf("${temp_dir}/${temp_chr}.gtf");
+	print_gtf($temp_transcript_ref, \%temp_tss_tts, "${temp_dir}/${temp_chr}_out.gtf");
+	my $temp_finish_time = Benchmark->new;
+	my $temp_time_spent = timediff($temp_finish_time, $temp_start_time);
+	$temp_date = `date $temp_date_format`;
+	chomp $temp_date;
+	print "[$temp_date]\tDone for $temp_chr in " . timestr($temp_time_spent) , "!\n";
+
+	return $temp_chr;
+}
+
+sub split_chromosome{
+	my ($temp_dir, $temp_in, $temp_tss, $temp_tts) = @_;
+	my %temp_chr = ();
+	open(my $temp_fh, "grep -v \"^#\" $temp_in | cut -f1 | sort | uniq |") or die "Cannot open $temp_in!\n";
+	while(<$temp_fh>){
+		chomp;
+		my $temp_chr = $_;
+		$temp_chr =~ s/\r//;
+		unless(exists $temp_chr{$temp_chr}){
+			$temp_chr{$temp_chr} = 1;
+		}
+		system("grep \"^$temp_chr\t\" $temp_in > ${temp_dir}/${temp_chr}.gtf");
+		system("grep \"_${temp_chr}_\" $temp_tss | cut -f1,4- > ${temp_dir}/${temp_chr}_tss.txt");
+		system("grep \"_${temp_chr}_\" $temp_tts | cut -f1,4- > ${temp_dir}/${temp_chr}_tts.txt");
+	}
+	close $temp_fh;
+
+	my @temp_chr = keys %temp_chr;
+	return \@temp_chr;
+}
+
+sub read_tss_tts{
+	my ($temp_ref, $temp_in, $temp_type) = @_;
+	open(my $temp_fh, $temp_in) or die "<ERROR> Cannot open $temp_in!\n";
+	while(<$temp_fh>){
+		chomp;
+		my $temp_line = $_;
+		$temp_line =~ s/\r//;
+		my @temp_line = split('\t', $temp_line);
+		#print "@temp_line\n";
+		my $temp_id = shift(@temp_line);
+		#print "@temp_line\n";
+		my $temp_depth = sum(@temp_line);
+		#print "$temp_depth\n";
+		my @temp_id = split('_', $temp_id);
+		my $temp_pos = pop(@temp_id);
+		my $temp_strand_code = $temp_id[-2];
+		my $temp_transcript_id = join("_", @temp_id);
+		unless(exists $temp_ref->{$temp_transcript_id}){
+			%{$temp_ref->{$temp_transcript_id}} = ();
+			%{$temp_ref->{$temp_transcript_id}{'tss'}} = ();
+			$temp_ref->{$temp_transcript_id}{'tss'}{'pos'} = -1;
+			$temp_ref->{$temp_transcript_id}{'tss'}{'depth'} = 0;
+			%{$temp_ref->{$temp_transcript_id}{'tts'}} = ();
+			$temp_ref->{$temp_transcript_id}{'tts'}{'pos'} = -1;
+			$temp_ref->{$temp_transcript_id}{'tts'}{'depth'} = 0;
+		}
+		if($temp_ref->{$temp_transcript_id}{$temp_type}{'pos'} == -1){
+			$temp_ref->{$temp_transcript_id}{$temp_type}{'pos'} = $temp_pos;
+			$temp_ref->{$temp_transcript_id}{$temp_type}{'depth'} = $temp_depth;
+			#print "Initiated at $temp_pos:$temp_depth\n";
+		}
+		if($temp_ref->{$temp_transcript_id}{$temp_type}{'depth'} == $temp_depth){
+			#print "Equal depth\n";
+			if($temp_type eq 'tss'){
+				if($temp_strand_code){
+					if($temp_ref->{$temp_transcript_id}{$temp_type}{'pos'} < $temp_pos){
+						$temp_ref->{$temp_transcript_id}{$temp_type}{'pos'} = $temp_pos;
+						$temp_ref->{$temp_transcript_id}{$temp_type}{'depth'} = $temp_depth;
+						#print "Updated at $temp_pos:$temp_depth\n";
+					}
+				}
+				else{
+					if($temp_ref->{$temp_transcript_id}{$temp_type}{'pos'} > $temp_pos){
+						$temp_ref->{$temp_transcript_id}{$temp_type}{'pos'} = $temp_pos;
+						$temp_ref->{$temp_transcript_id}{$temp_type}{'depth'} = $temp_depth;
+						#print "Updated at $temp_pos:$temp_depth\n";
+					}
+				}
+			}
+			elsif($temp_type eq 'tts'){
+				if($temp_strand_code){
+					if($temp_ref->{$temp_transcript_id}{$temp_type}{'pos'} > $temp_pos){
+						$temp_ref->{$temp_transcript_id}{$temp_type}{'pos'} = $temp_pos;
+						$temp_ref->{$temp_transcript_id}{$temp_type}{'depth'} = $temp_depth;
+						#print "Updated at $temp_pos:$temp_depth\n";
+					}
+				}
+				else{
+					if($temp_ref->{$temp_transcript_id}{$temp_type}{'pos'} < $temp_pos){
+						$temp_ref->{$temp_transcript_id}{$temp_type}{'pos'} = $temp_pos;
+						$temp_ref->{$temp_transcript_id}{$temp_type}{'depth'} = $temp_depth;
+						#print "Updated at $temp_pos:$temp_depth\n";
+					}
+				}
+			}
+		}
+		elsif($temp_ref->{$temp_transcript_id}{$temp_type}{'depth'} < $temp_depth){
+			#print "Greater depth\n";
+			if($temp_type eq 'tss'){
+				if($temp_strand_code){
+					$temp_ref->{$temp_transcript_id}{$temp_type}{'pos'} = $temp_pos;
+					$temp_ref->{$temp_transcript_id}{$temp_type}{'depth'} = $temp_depth;
+					#print "Updated at $temp_pos:$temp_depth\n";
+				}
+				else{
+					$temp_ref->{$temp_transcript_id}{$temp_type}{'pos'} = $temp_pos;
+					$temp_ref->{$temp_transcript_id}{$temp_type}{'depth'} = $temp_depth;
+					#print "Updated at $temp_pos:$temp_depth\n";
+				}
+			}
+			elsif($temp_type eq 'tts'){
+				if($temp_strand_code){
+					$temp_ref->{$temp_transcript_id}{$temp_type}{'pos'} = $temp_pos;
+					$temp_ref->{$temp_transcript_id}{$temp_type}{'depth'} = $temp_depth;
+					#print "Updated at $temp_pos:$temp_depth\n";
+				}
+				else{
+					$temp_ref->{$temp_transcript_id}{$temp_type}{'pos'} = $temp_pos;
+					$temp_ref->{$temp_transcript_id}{$temp_type}{'depth'} = $temp_depth;
+					#print "Updated at $temp_pos:$temp_depth\n";
+				}
+			}
+		}
+	}
+	close $temp_fh;
+
+	return 1;
+}
+
+sub read_gtf{
+	my ($temp_gtf) = @_;
+	open(my $temp_fh, "sort -k 1,1 -k 4,4n $temp_gtf |") or die "<ERROR> Cannot open $temp_gtf!\n";
+	my %temp_transcript = ();
+	while(<$temp_fh>){
+		chomp;
+		my $temp_line = $_;
+		my @temp_line = split('\t', $temp_line);
+		unless($temp_line[2] eq 'exon'){
+			next;
+		}
+		my $temp_gene_id;
+		if($temp_line[8] =~ /(^|\s)gene_id \"?([^";]+)\"?/){
+			$temp_gene_id = $2;
+		}
+		else{
+			print STDERR "<ERROR> gene_id missing at line\n$temp_line\n";
+			exit;
+		}
+		my $temp_transcript_id;
+		if($temp_line[8] =~ /(^|\s)transcript_id \"?([^";]+)\"?/){
+			$temp_transcript_id = $2;
+		}
+		else{
+			print STDERR "<ERROR> transcript_id missing at line\n$temp_line\n";
+			exit;
+		}
+		unless(exists $temp_transcript{$temp_transcript_id}){
+			%{$temp_transcript{$temp_transcript_id}} = ();
+			$temp_transcript{$temp_transcript_id}{'gene_id'} = $temp_gene_id;
+			$temp_transcript{$temp_transcript_id}{'chr'} = $temp_line[0];
+			$temp_transcript{$temp_transcript_id}{'strand'} = $temp_line[6];
+			@{$temp_transcript{$temp_transcript_id}{'exon'}} = ();
+		}
+		if($temp_line[2] eq 'exon'){
+			my @temp_exon = ($temp_line[3], $temp_line[4]);
+			push(@{$temp_transcript{$temp_transcript_id}{'exon'}}, \@temp_exon);
+		}
+	}
+	close $temp_fh;
+
+	return \%temp_transcript;
+}
+
+
+sub print_gtf{
+	my ($temp_transcript_ref, $temp_tss_tts_ref, $temp_out) = @_;
+	open(my $temp_fh, "| sort -k1,1 -k4,4n > $temp_out") or die "<ERROR> Cannot create $temp_out!\n";
+	my %temp_gene = ();
+	foreach my $temp_transcript_id (keys %$temp_transcript_ref){
+		my $temp_gene_id = $temp_transcript_ref->{$temp_transcript_id}{'gene_id'};
+		my $temp_chr = $temp_transcript_ref->{$temp_transcript_id}{'chr'};
+		my $temp_strand = $temp_transcript_ref->{$temp_transcript_id}{'strand'};
+		my @temp_exon = @{$temp_transcript_ref->{$temp_transcript_id}{'exon'}};
+		my $temp_num_exon = @{$temp_transcript_ref->{$temp_transcript_id}{'exon'}};
+		unless((exists $temp_tss_tts_ref->{$temp_transcript_id}) && ($temp_tss_tts_ref->{$temp_transcript_id}{'tss'} > 0) && ($temp_tss_tts_ref->{$temp_transcript_id}{'tts'} > 0)){
+			print STDERR "<ERROR> Missing TSS/TTS information for $temp_transcript_id!\n";
+			exit;
+		}
+		if($temp_strand eq '-'){
+			$temp_exon[0][0] = $temp_tss_tts_ref->{$temp_transcript_id}{'tts'}{'pos'};
+			$temp_exon[$temp_num_exon-1][1] = $temp_tss_tts_ref->{$temp_transcript_id}{'tss'}{'pos'};
+		}
+		else{
+			$temp_exon[0][0] = $temp_tss_tts_ref->{$temp_transcript_id}{'tss'}{'pos'};
+			$temp_exon[$temp_num_exon-1][1] = $temp_tss_tts_ref->{$temp_transcript_id}{'tts'}{'pos'};
+		}
+		unless(exists $temp_gene{$temp_gene_id}){
+			%{$temp_gene{$temp_gene_id}} = ();
+			$temp_gene{$temp_gene_id}{'chr'} = $temp_chr;
+			$temp_gene{$temp_gene_id}{'strand'} = $temp_strand;
+			$temp_gene{$temp_gene_id}{'left'} = $temp_exon[0][0];
+			$temp_gene{$temp_gene_id}{'right'} = $temp_exon[$temp_num_exon-1][1];
+		}
+		print $temp_fh "$temp_chr\tisoPropeller\ttranscript\t$temp_exon[0][0]\t$temp_exon[$temp_num_exon-1][1]\t.\t$temp_strand\t.\tgene_id \"$temp_gene_id\"\; transcript_id \"$temp_transcript_id\"\;\n";
+		for(my $i = 0; $i < $temp_num_exon; $i++){
+			my $temp_cur_exon_num;
+			if($temp_strand eq '-'){
+				$temp_cur_exon_num = $temp_num_exon - $i;
+			}
+			else{
+				$temp_cur_exon_num = $i + 1;
+			}
+			print $temp_fh "$temp_chr\tisoPropeller\texon\t$temp_exon[$i][0]\t$temp_exon[$i][1]\t.\t$temp_strand\t.\tgene_id \"$temp_gene_id\"\; transcript_id \"$temp_transcript_id\"\; exon_number \"$temp_cur_exon_num\"\;\n";
+		}
+	}
+	foreach my $temp_gene_id (keys %temp_gene){
+		print $temp_fh "$temp_gene{$temp_gene_id}{'chr'}\tisoPropeller\tgene\t$temp_gene{$temp_gene_id}{'left'}\t$temp_gene{$temp_gene_id}{'right'}\t.\t$temp_gene{$temp_gene_id}{'strand'}\t.\tgene_id \"$temp_gene_id\"\;\n";
+	}
+	close $temp_fh;
+
+	return 1;
+}
+
+
+
+

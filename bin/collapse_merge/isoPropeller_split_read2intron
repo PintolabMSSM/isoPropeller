@@ -1,0 +1,337 @@
+#!/usr/bin/env perl
+#Author: ALin
+#Purpose: To identify introns (exon-exon junctions) according to split read sites.
+#Usage: perl isoPropeller_split_read2intron_${version}.pl [option]
+#		-i <String> Input bam file
+#		-o <String> Output
+#		-s <String> Strand of reads (Default: unstranded; RF for dUTP method; D for Nanopore direct RNA-seq or Pac-Bio Iso-seq long-read)
+#		-q <Integer> Minimal mapping quality (Inclusive; default: 0)
+#		-t <Integer> The number of threads to use (Default: 1)
+#		-btp <String> The path to bedtools
+#		-stp <String> The path to samtools
+#		-h <Boolean> Help
+#Change log:
+#	v1.1	2021-03	This script is a copy of split_reads2intron_gtf_v1.4.pl, except that the source column in the output .gtf file was changed to "isoPropeller".
+#	v1.2	2021-08 It is now able to distinguish single-end and pair-end data.
+#	v1.3	2022-07 Resctructured the codes and enabled multi-threading. Alignments that are not primary will be filtered out.
+
+use strict;
+use Getopt::Long;
+use Benchmark qw(:hireswallclock);
+use threads;
+
+my $total_start_time = Benchmark->new;
+
+my $version = "v1.3";
+my $random = `tr -dc A-Za-z0-9 </dev/urandom | head -c 10`;
+
+my ($in, $out, $lib_strand, $mapq, $num_thread, $btp, $stp, $help) = ("", "", "", 0, 1, "", "", 0);
+
+GetOptions(
+	'i=s'	=>	\$in,
+	'o=s'	=>	\$out,
+	's=s'	=>	\$lib_strand,
+	'q=i'	=>	\$mapq,
+	't=i'	=>	\$num_thread,
+	'btp=s'	=>	\$btp,
+	'stp=s'	=>	\$stp,
+        'h!'    =>      \$help,
+);
+
+if($help){
+        print_usage();
+        exit;
+}
+
+unless($btp){
+	$btp = "bedtools";
+}
+
+unless(`which $btp`){
+	print "Incorrect path for bedtools!\n";
+	print_usage();
+	exit;
+}
+
+unless($stp){
+	print "Set samtools path...\n";
+	$stp = "samtools";
+}
+
+unless(`which $stp`){
+	print "Incorrect path for samtools!\n";
+	print_usage();
+	exit;
+}
+
+unless($in && $out){
+	print_usage();
+	exit;
+}
+
+open(OUT, "> $out") or die "Cannot create $out!\n";
+print OUT "#perl isoPropeller_split_read2intron_${version}.pl -i $in -o $out -s $lib_strand -q $mapq -t $num_thread -btp $btp -stp $stp\n";
+close OUT;
+
+system("date");
+
+my $total_thread = `grep -c \"^processor\" /proc/cpuinfo`;
+chomp $total_thread;
+
+if($num_thread > $total_thread){
+	print "Exceeding the maximal total number of threads! Setting the number of thread to $total_thread...";
+		$num_thread = $total_thread;
+}
+
+print "Preprocessing files...\n";
+my $start_time = Benchmark->new;
+my ($chr_ref) = split_bam($in, $random, $stp, $num_thread);
+my $finish_time = Benchmark->new;
+my $time_spent = timediff($finish_time, $start_time);
+print "Used ".timestr($time_spent)." to preprocess $in.\n";
+
+my $chr_pos = 0;
+my @thread = ();
+my @running = ();
+
+while(@thread < @$chr_ref){
+	@running = threads->list(threads::running);
+	if(@running < $num_thread){
+		my $thread = threads->create(\&worker, $chr_ref->[$chr_pos], $random, $lib_strand, $mapq, $stp);
+		push(@thread, $thread);
+		$chr_pos++;
+	}
+}
+
+foreach my $thread (@thread){
+	$thread->join();
+}
+
+system("cat temp_${random}_*_intron.gtf | $btp sort >> $out");
+system("rm temp_${random}*");
+
+my $total_finish_time = Benchmark->new;
+my $total_time_spent = timediff($total_finish_time, $total_start_time);
+print "Total time used: ". timestr($total_time_spent) . "\n";
+system("date");
+
+sub worker{
+	my ($temp_chr, $temp_random, $temp_lib_strand, $temp_mapq, $temp_stp) = @_;
+	print "Starting to process $temp_chr...\n";
+	my $temp_start_time = Benchmark->new;
+	my $temp_intron_ref = read_bam("temp_${temp_random}_${temp_chr}.bam", $temp_mapq, $temp_lib_strand, $temp_stp);
+	print_intron($temp_chr, $temp_random, $temp_intron_ref);
+	my $temp_finish_time = Benchmark->new;
+	my $temp_time_spent = timediff($temp_finish_time, $temp_start_time);
+	print "Done for $temp_chr in  " . timestr($time_spent) . "!\n";
+
+	return 1;
+}
+
+sub print_usage{
+	print "Usage: perl isoPropeller_split_read2intron_${version}.pl [option]
+	-i <String> Input bam file
+	-o <String> Output
+	-s <String> Strand of reads (Default: unstranded; RF for dUTP method; D for Nanopore direct RNA-seq or Pac-Bio Iso-Seq long-read)
+	-q <Integer> Minimal mapping quality (Inclusive; default: 0)
+	-t <Integer> The number of threads to use (Default: 1)
+	-btp <String> The path to bedtools
+	-stp <String> The path to samtools
+	-h <Boolean> Help\n";
+
+	return 1;
+}
+
+sub split_bam{
+	my ($temp_bam, $temp_random, $temp_stp, $temp_num_thread) = @_;
+	system("$temp_stp sort -@ $temp_num_thread $temp_bam -o temp_${temp_random}.bam");
+	system("$temp_stp index temp_${temp_random}.bam");
+	open(TEMP, "$temp_stp view -H temp_${temp_random}.bam | grep \"^\@SQ\" | cut -d':' -f2 | cut -f1 | sort | uniq |") or die "Cannot open temp_${temp_random}.bam!\n";
+	my @temp_chr = ();
+	while(<TEMP>){
+		chomp;
+		my $temp_line = $_;
+		$temp_line =~ s/\r//;
+		system("$temp_stp view -b temp_${temp_random}.bam $temp_line > temp_${temp_random}_${temp_line}.bam");
+		push(@temp_chr, $temp_line);
+	}
+	close TEMP;
+
+	return (\@temp_chr);
+}
+
+sub read_bam{
+	my ($temp_bam, $temp_mapq, $temp_lib_strand, $temp_stp) = @_;
+	my %temp_intron = ();
+	open(TEMP, "$temp_stp view $temp_bam |") or die "Cannot open $temp_bam!\n";
+	while(<TEMP>){
+		chomp;
+		my $temp_line = $_;
+		my @temp_line = split('\t', $temp_line);
+		unless($temp_line[5] =~ /\d+N/){
+			next;
+		}
+#		print "$line\n";
+#		print "$line[0]\t$line[1]\n";
+		if($temp_line[4] < $temp_mapq || $temp_line[2] eq "*"){
+			next;
+		}
+#		unless($line[1] & 0x2){
+			#Not properly paired
+#			next OUTTER;
+#		}
+		if($temp_line[1] & 0x100){
+			#Not primary alignment
+			next;
+		}
+		if($temp_line[1] & 0x400){
+			#Poor reads
+			next;
+		}
+		if($temp_line[1] & 0x800){
+			#Supplementary alignment
+			next;
+		}
+		my $temp_strand;
+		if($temp_lib_strand eq "FR"){
+			#print "FR\n";
+			if($temp_line[1] & 0x1){
+				if($temp_line[1] & 0x40){
+					if($temp_line[1] & 0x10){
+						$temp_strand = "-";
+					}
+					else{
+						$temp_strand = "+";
+					}
+				}
+				elsif($temp_line[1] & 0x80){
+					if($temp_line[1] & 0x10){
+						$temp_strand = "+";
+					}
+					else{
+						$temp_strand = "-";
+					}
+				}
+			}
+			else{
+				if($temp_line[1] & 0x10){
+					$temp_strand = "-";
+				}
+				else{
+					$temp_strand = "+";
+				}
+			}
+		}
+		elsif($temp_lib_strand eq "RF"){
+			#print "RF\n";
+			if($temp_line[1] & 0x1){
+				if($temp_line[1] & 0x40){
+       	         	        if($temp_line[1] & 0x10){
+						$temp_strand = "+";
+					}
+					else{
+						$temp_strand = "-";
+					}
+				}
+				elsif($temp_line[1] & 0x80){
+					if($temp_line[1] & 0x10){
+						$temp_strand = "-";
+					}
+					else{
+						$temp_strand = "+";
+					}
+				}
+			}
+			else{
+				if($temp_line[1] & 0x10){
+					$temp_strand = "+";
+				}
+				else{
+					$temp_strand = "-";
+				}
+			}
+		}
+		elsif($temp_lib_strand eq "D"){
+			if($temp_line[1] & 0x1){
+				print "It seems that the data is pair-end and should not long-read data. Please double check.\n";
+				exit;
+			}
+			if($temp_line[1] & 0x10){
+				$temp_strand = "-";
+			}
+			else{
+				$temp_strand = "+";
+			}
+		}
+		else{
+			$temp_strand = ".";
+		}
+#		print "$strand\n";
+		my @temp_cigar = ();
+		my $temp_pos = $temp_line[3] - 1;
+		while($temp_line[5] =~ /^(\d+)(\w)/){
+			my $temp_temp_length = $1;
+			my $temp_status = $2;
+			push(@temp_cigar, $temp_status);
+			push(@temp_cigar, $temp_temp_length);
+			$temp_line[5] =~ s/^(\d+)(\w)//;
+		}
+		my $temp_num_cigar = @temp_cigar;
+#		print "$line[2]\n$line[0]\t$pos\n";
+		for(my $i = 0; $i < $temp_num_cigar; $i+=2){
+#			print "$cigar[$i]$cigar[$i+1]\t";
+			if($temp_cigar[$i] eq "N"){
+				#First deal with the left exon
+				my $temp_pos1 = $temp_pos + 1;
+				unless(exists $temp_intron{$temp_pos1}){
+					%{$temp_intron{$temp_pos1}} =();
+				}
+				#Then deal with the right exon
+				$temp_pos += $temp_cigar[$i+1];
+				my $temp_pos2 = $temp_pos;
+				unless(exists $temp_intron{$temp_pos1}{$temp_pos2}){
+					%{$temp_intron{$temp_pos1}{$temp_pos2}} =();
+				}
+				unless(exists $temp_intron{$temp_pos1}{$temp_pos2}{$temp_strand}){
+					$temp_intron{$temp_pos1}{$temp_pos2}{$temp_strand} = 0;
+				}
+				$temp_intron{$temp_pos1}{$temp_pos2}{$temp_strand}++;
+#				print "$line[2]\_$pos1\-$pos2\_$strand\t$intron{$line[2]}{$pos1}{$pos2}{$strand}\n";
+			}
+			elsif(($temp_cigar[$i] eq "M") || ($temp_cigar[$i] eq "D")){
+				$temp_pos += $temp_cigar[$i+1];
+			}
+		}
+	}
+	close TEMP;
+
+	return \%temp_intron;
+}
+
+sub print_intron{
+	my ($temp_chr, $temp_random, $temp_intron_ref) = @_;
+	open(TEMP, "> temp_${temp_random}_${temp_chr}_intron.gtf") or die "Cannot create temp_${temp_random}_${temp_chr}_intron.gtf!\n";
+	foreach my $temp_pos1 (keys %$temp_intron_ref){
+			foreach my $temp_pos2 (keys %{$temp_intron_ref->{$temp_pos1}}){
+				foreach my $temp_strand (keys %{$temp_intron_ref->{$temp_pos1}->{$temp_pos2}}){
+					if($temp_strand eq "."){
+						print TEMP "$temp_chr\tisoPropeller\tintron\t$temp_pos1\t$temp_pos2\t.\t+\t.\tintron_id \"${temp_chr}_${temp_pos1}-${temp_pos2}_+\"\; depth \"$temp_intron_ref->{$temp_pos1}->{$temp_pos2}->{$temp_strand}\"\;\n";
+						print TEMP "\n$temp_chr\tisoPropeller\tintron\t$temp_pos1\t$temp_pos2\t.\t-\t.\tintron_id \"${temp_chr}_${temp_pos1}-${temp_pos2}_-\"\; depth \"$temp_intron_ref->{$temp_pos1}->{$temp_pos2}->{$temp_strand}\"\;\n";
+					}
+					else{
+						print TEMP "$temp_chr\tisoPropeller\tintron\t$temp_pos1\t$temp_pos2\t.\t$temp_strand\t.\tintron_id \"${temp_chr}_${temp_pos1}-${temp_pos2}_${temp_strand}\"\; depth \"$temp_intron_ref->{$temp_pos1}->{$temp_pos2}->{$temp_strand}\"\;\n";
+					}
+				}
+			}
+	}
+	close TEMP;
+
+	return 1;
+}
+
+
+
+
+
+
+
