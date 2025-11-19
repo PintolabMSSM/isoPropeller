@@ -1,8 +1,9 @@
 #!/usr/bin/env perl
 =start
 Author: ALin
-Purpose: To update gtf ends based on the output with the most read supports from isoPropeller_quantification_TSS/TTS_vx.pl.
+Purpose: To update gtf ends based on the output with the most read supports from NIAP_quantification_TSS/TTS_vx.pl.
 Change log:
+	v1.2	2025-11	Kept original TSS and TTS for isoforms whose updated TSS and TTS are incompactable.
 =cut
 
 use strict;
@@ -13,11 +14,11 @@ use List::Util qw(sum);
 
 my $total_start_time = Benchmark->new;
 
-my $version = 'v1.1';
+my $version = 'v1.2';
 
 my ($in, $out, $tss, $tts, $num_thread, $help) = ('', '', '', '', 1, 0);
 
-my $usage = "Usage: perl isoPropeller_end_update.pl
+my $usage = "Usage: perl NIAP_end_update.pl
 	-i <String> Input gtf file
 	-o <String> Output gtf file
 	-a <String> TSS quantification file
@@ -63,12 +64,12 @@ unless(-e $tts){
 my $date_format = "+%F-%T.%3N";
 my $date = `date $date_format`;
 chomp $date;
-print "[$date]\tperl isoPropeller_end_update_${version}.pl -i $in -o $out -a $tss -b $tts -t $num_thread\n";
+print "[$date]\tperl NIAP_end_update_${version}.pl -i $in -o $out -a $tss -b $tts -t $num_thread\n";
 open(my $fh, "> $out") or die "Cannot create $out!\n";
-print $fh "#perl isoPropeller_end_update_${version}.pl -i $in -o $out -a $tss -b $tts -t $num_thread\n";
+print $fh "#perl NIAP_end_update_${version}.pl -i $in -o $out -a $tss -b $tts -t $num_thread\n";
 close $fh;
 
-my $dir = "${out}__isoPropeller_end_update_temp";
+my $dir = "${out}__NIAP_end_update_temp";
 if(-d $dir){
 	print STDERR "<WARNNING> Temporary directory $dir exists! Will overwrite it...\n";
 	system("rm ${dir}/*");
@@ -334,12 +335,22 @@ sub print_gtf{
 			exit;
 		}
 		if($temp_strand eq '-'){
-			$temp_exon[0][0] = $temp_tss_tts_ref->{$temp_transcript_id}{'tts'}{'pos'};
-			$temp_exon[$temp_num_exon-1][1] = $temp_tss_tts_ref->{$temp_transcript_id}{'tss'}{'pos'};
+			if($temp_tss_tts_ref->{$temp_transcript_id}{'tss'}{'pos'} > $temp_tss_tts_ref->{$temp_transcript_id}{'tts'}{'pos'}){
+				$temp_exon[0][0] = $temp_tss_tts_ref->{$temp_transcript_id}{'tts'}{'pos'};
+				$temp_exon[$temp_num_exon-1][1] = $temp_tss_tts_ref->{$temp_transcript_id}{'tss'}{'pos'};
+			}
+			else{
+				print "<WARNING> $temp_transcript_id not updated\n";
+			}
 		}
 		else{
-			$temp_exon[0][0] = $temp_tss_tts_ref->{$temp_transcript_id}{'tss'}{'pos'};
-			$temp_exon[$temp_num_exon-1][1] = $temp_tss_tts_ref->{$temp_transcript_id}{'tts'}{'pos'};
+			if($temp_tss_tts_ref->{$temp_transcript_id}{'tts'}{'pos'} > $temp_tss_tts_ref->{$temp_transcript_id}{'tss'}{'pos'}){
+				$temp_exon[0][0] = $temp_tss_tts_ref->{$temp_transcript_id}{'tss'}{'pos'};
+				$temp_exon[$temp_num_exon-1][1] = $temp_tss_tts_ref->{$temp_transcript_id}{'tts'}{'pos'};
+			}
+			else{
+				print "<WARNING> $temp_transcript_id not updated\n";
+			}
 		}
 		unless(exists $temp_gene{$temp_gene_id}){
 			%{$temp_gene{$temp_gene_id}} = ();
@@ -348,7 +359,7 @@ sub print_gtf{
 			$temp_gene{$temp_gene_id}{'left'} = $temp_exon[0][0];
 			$temp_gene{$temp_gene_id}{'right'} = $temp_exon[$temp_num_exon-1][1];
 		}
-		print $temp_fh "$temp_chr\tisoPropeller\ttranscript\t$temp_exon[0][0]\t$temp_exon[$temp_num_exon-1][1]\t.\t$temp_strand\t.\tgene_id \"$temp_gene_id\"\; transcript_id \"$temp_transcript_id\"\;\n";
+		print $temp_fh "$temp_chr\tNIAP\ttranscript\t$temp_exon[0][0]\t$temp_exon[$temp_num_exon-1][1]\t.\t$temp_strand\t.\tgene_id \"$temp_gene_id\"\; transcript_id \"$temp_transcript_id\"\;\n";
 		for(my $i = 0; $i < $temp_num_exon; $i++){
 			my $temp_cur_exon_num;
 			if($temp_strand eq '-'){
@@ -357,11 +368,11 @@ sub print_gtf{
 			else{
 				$temp_cur_exon_num = $i + 1;
 			}
-			print $temp_fh "$temp_chr\tisoPropeller\texon\t$temp_exon[$i][0]\t$temp_exon[$i][1]\t.\t$temp_strand\t.\tgene_id \"$temp_gene_id\"\; transcript_id \"$temp_transcript_id\"\; exon_number \"$temp_cur_exon_num\"\;\n";
+			print $temp_fh "$temp_chr\tNIAP\texon\t$temp_exon[$i][0]\t$temp_exon[$i][1]\t.\t$temp_strand\t.\tgene_id \"$temp_gene_id\"\; transcript_id \"$temp_transcript_id\"\; exon_number \"$temp_cur_exon_num\"\;\n";
 		}
 	}
 	foreach my $temp_gene_id (keys %temp_gene){
-		print $temp_fh "$temp_gene{$temp_gene_id}{'chr'}\tisoPropeller\tgene\t$temp_gene{$temp_gene_id}{'left'}\t$temp_gene{$temp_gene_id}{'right'}\t.\t$temp_gene{$temp_gene_id}{'strand'}\t.\tgene_id \"$temp_gene_id\"\;\n";
+		print $temp_fh "$temp_gene{$temp_gene_id}{'chr'}\tNIAP\tgene\t$temp_gene{$temp_gene_id}{'left'}\t$temp_gene{$temp_gene_id}{'right'}\t.\t$temp_gene{$temp_gene_id}{'strand'}\t.\tgene_id \"$temp_gene_id\"\;\n";
 	}
 	close $temp_fh;
 
