@@ -32,12 +32,12 @@ for ( tg in tglist ){
    }
    threshold     = ifelse( length(selected)<2, 1, floor(length(selected)/2) )
    row_selection = (ratio$cluster_size==1)  &  (ratio$monoexonic==0)  &  (ratio$num_pc<2)  &  (ratio[[ paste0( "num_passed_sample_", tg) ]]>threshold)
-   if ( any(row_selection) ){
+   #if ( any(row_selection) ){
       write.table(ratio$gene_id[ row_selection ], 
                   file      = paste0(args[1], "_reclocus_", tg, "_gene_id.txt"), 
                   sep       = "\n", 
                   col.names = FALSE, 
                   row.names = FALSE, 
                   quote     = FALSE)
-   }
+   #}
 }
