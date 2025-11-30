@@ -1,5 +1,5 @@
 {% set name                = "isoPropeller" %}
-{% set version             = "1.9" %}
+{% set version             = "1.9.2" %}
 
 package:
   name: "{{ name|lower }}"
