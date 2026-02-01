@@ -14,7 +14,7 @@ The overall outline of the isoPropeller collapse workflow is shown below. Briefl
 
 
 
-<img src="docs/images/isoPropeller_collapse.png" alt="isoPropeller_collapse"  style="zoom: 36%;" />
+<img src="docs/images/isoPropeller_collapse.png" alt="isoPropeller_collapse"  width="400" />
 
 
 
