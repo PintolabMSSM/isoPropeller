@@ -1,6 +1,14 @@
 ## IsoPropeller
 
-**isoPropeller** is a versatile suite of command-line utilities designed for the structural analysis of long-read RNA sequencing data. It specializes in collapsing alignments into non-redundant isoforms, analyzing transcription start/end site distributions, and providing reference-based isoform classifications.
+This repository is part of a suite of three interconnected repositories that together form the **isoPropeller** computational framework for the analysis of long-read RNA-seq data:
+
+- **isoPropeller**: The core standalone command-line utilities.
+- **isoPropeller-collapse**: Snakemake workflow for read processing, RNA isoform discovery, and QC.  
+- **isoPropeller-annotate**: Snakemake workflow for functional characterization of isoforms and coding sequences.
+
+The isoPropeller framework provides an end-to-end solution including read processing, quality control, and reference-free transcript model reconstruction across biological replicates, followed by quantification, high-stringency filtering, and functional annotation.
+
+The core isoPropeller repository provides the tools for collapsing alignments into non-redundant isoforms, analyzing transcription start/termination site (TSS/TTS)  distributions, and providing reference-based isoform classifications. It is designed to support both "Call & Join" workflows, where transcripts are identified in individual samples before merging, and "Join & Call" strategies, where isoforms are further clustered across samples to increase the sensitivity for discovering rare, lowly-expressed novel isoforms. This is possible because isoPropeller retains the full splice-chain, read count, and TSS/TTS information per sample. By providing high-fidelity intrapriming filtering and coordinate-aware collapsing, isoPropeller facilitates the construction of consensus transcriptomes across diverse research objectives and computational scales.
 
 > **Note on Usage:** While the standalone commands are detailed below, the recommended way to use isoPropeller is via the automated **[isoPropeller-collapse](https://github.com/PintolabMSSM/isoPropeller-collapse)** and **[isoPropeller-annotate](https://github.com/PintolabMSSM/isoPropeller-annotate)** Snakemake workflows. These workflows manage dependencies, parallelization, and data integration automatically.
 
@@ -10,7 +18,7 @@ IsoPropeller is available as an anaconda package: https://anaconda.org/channels/
 
 ## Overview of the IsoPropeller collapse workflow
 
-The overall outline of the isoPropeller collapse workflow is shown below. Briefly, reads are first collapsed into isoforms per sample. During this stage, intrapriming filtering is performed to remove reads that were primed from AT-rich regions in the genome rather than valid termination sites. Transcription start and termination sites are also annotated during this stage for further downstream analysis of isoform ends. Finally, the per-sample results are filtered to keep only isoforms detected by two or more reads, and merged across all samples in a dataset by clustering identical splice chains.
+The overall outline of the isoPropeller collapse workflow is shown below. Briefly, reads are first collapsed into isoforms per sample. During this stage, intrapriming filtering is performed to remove reads that were primed from AT-rich regions in the genome rather than valid termination sites. Transcription start and termination sites (TSS/TTS) are also annotated during this stage for further downstream analysis of isoform ends. Finally, the per-sample results are optionally filtered to keep only isoforms detected by two or more reads, and merged across all samples in a dataset by clustering identical splice-chains.
 
 
 
@@ -18,7 +26,7 @@ The overall outline of the isoPropeller collapse workflow is shown below. Briefl
 
 
 
-### Collapsing reads into isoforms
+### Reference-free transcript model reconstruction per sample
 
 The `isoPropeller` command is used to collapse reads in a .bam file into isoforms in a .gtf file. Reads that are likely intrapriming are filtered out. Monoexonic reads without 5' support are also filtered out. Multiexonic reads with the exact set of exon-exon junction(s) and being mapped in the same direction will be collapsed into one transcript. On the other hand, overlapping monoexonic transcripts will be merged to generate one transcript. In both cases, the longest 5' and 3' ends, among the transcripts to be merged, will be taken as the boundaries of the transcript. The distribution of all 5' and 3' ends will also be recorded.
 
@@ -74,9 +82,9 @@ isoPropeller \
 
 
 
-### Merging isoforms across samples
+### Reference-free transcript model reconstruction by merging isoforms across samples
 
-The script `isoPropeller_merge` is used to merge the isofrom .gtf files of different samples by merging isoforms with the same structure and renaming consistently. Multiexonic transcirpts with the exact set of exon-exon junction(s) and being transcribed from the same direction will be merged into one representative transcript. On the other hand, overlapping monoexonic transcripts will be merged to generate a representative transcript. In both cases, the longest 5' and 3' ends, among the transcripts to be merged, will be taken for the representative transcript. A schematic illustration is shown above.
+The script `isoPropeller_merge` is used to merge the isoform .gtf files of different samples by merging isoforms with the same structure and renaming consistently. Multiexonic transcirpts with the exact set of exon-exon junction(s) and being transcribed from the same direction will be merged into one representative transcript. On the other hand, overlapping monoexonic transcripts will be merged to generate a representative transcript. In both cases, the longest 5' and 3' ends, among the transcripts to be merged, will be taken for the representative transcript. A schematic illustration is shown above.
 
 ```bash
 # Gather list of all gtf files for merging
@@ -105,9 +113,9 @@ The IDs of a gene and a transcript after merging as `"MAP_<CHR>_[01]_<LOCI_NUM>_
 
 
 
-### Clustering of unique splice chain based on 5' and 3' ends
+### Clustering of unique splice-chain based on 5' and 3' ends
 
-The merged multiexonic isoforms can be further split to different isoforms clusters based on their 5' and 3' ends using the `isoPropeller_merge_split` script. The output files `*_end_dist.txt` from the **Isoform identification** step for all samples are needed, as well as the `MAP_id.txt` file from the **Merging multiple samples**.
+The merged multiexonic isoforms can be further split to different isoforms clusters based on their 5' and 3' ends using the `isoPropeller_merge_split` script. The output files `*_end_dist.txt` from the **Isoform identification** step for all samples are needed, as well as the `MAP_id.txt` file from the **Merging multiple samples** step.
 
 ```bash
 for ed in `ls *_end_dist.txt`; do echo $ed; done > temp_end_dist_list.txt
@@ -115,11 +123,11 @@ perl isoPropeller_merge_split -i temp_end_dist_list.txt -o MAP_clustered -g MAP.
 rm temp_end_dist_list.txt
 ```
 
-Four files will be generated, with `MAP_clustered.gtf` showing all isoforms, `MAP_clustered_exp.txt` showing the read count, `MAP_clustered_tss.bed` showing the TSS regions and `MAP_clustered_tts.bed` showing the TTS regions after the clustering step. All gene_id in the .gtf file will remain the same. A string `_\<cluster ID\>` will be appended to the original transcript_id to indicate which cluster of a unique splice chain the isoform belongs to.
+Four files will be generated, with `MAP_clustered.gtf` containing all isoforms, `MAP_clustered_exp.txt` containing the read count, `MAP_clustered_tss.bed` containing the TSS regions and `MAP_clustered_tts.bed` containing the TTS regions after the clustering step. All gene_id tags in the .gtf file will remain the same. A string `_\<cluster ID\>` will be appended to the original transcript_id to indicate which cluster of a unique splice-chain the isoform belongs to.
 
 ### Defining TSS/TTS regions
 
-Since the TSSs/TTSs are variable according to the data, the regions, instead of single-base positions, can be defined.
+Since the TSSs/TTSs positions can be variable for splice-chains, they are further grouped into regions.
 
 ```bash
 for ed in `ls *_end_dist.txt`; do echo $ed; done > temp_end_dist_list.txt
@@ -131,7 +139,7 @@ Two files will be generated, with `MAP_tss.bed` and `MAP_tts.bed` indicating the
 
 ### Preparing 5' and 3' end metrics
 
-In the **Isoform identification** step, read depths of all TSS-TTS combination in a unique splice chain are recorded in the `*_end_dist.txt` file. Various metrics can be calculated from this file, including the followings.
+In the **Isoform identification** step, read depths of all TSS-TTS combination in a unique splice-chain are recorded in the `*_end_dist.txt` file. Various metrics are calculated from this file, including the following:
 
 ```
 ends_entropy:                     The entropy of TSS-TTS combination
@@ -142,7 +150,7 @@ tss_sd/tts_sd:                    The standard deviation of TSS/TTS position
 tss_max_diff/tts_max_diff:        The range of possible TSS/TTS
 ```
 
-Each of the above metrics can be combined across all samples into a matrix for downstream analyses.
+Each of the above metrics can be combined across all samples into a matrix for downstream analyses:
 
 ```bash
 for ed in `ls *_end_dist.txt`
@@ -161,23 +169,23 @@ do
 done
 ```
 
-The output files `MAP_${type}_renamed.txt` are the matrix of all the metrics with proper headers.
+The output files `MAP_${type}_renamed.txt` are the matrices of all the metrics with proper headers.
 
 
 
 ## Overview of the isoPropeller reference-based annotation workflow
 
-In this step, all isoforms in the map will be compared with the reference annotation and **(A)** classified according to their overlaps. **(B)** Transcription start (TSS) and termination sites (TTS) will also be clustered into regions. **(C)** Finally, ORF regions are also identified, leveraging annotations by CPAT, GMST and Transdecoder.
+In this step, all isoforms per sample or merged across samples will be compared with the reference annotation and **(A)** classified according to their overlaps. **(B)** Transcription start (TSS) and termination sites (TTS) will also be clustered into regions. **(C)** Finally, open reading frames (ORF) regions are also identified, leveraging annotations by [CPAT](https://github.com/liguowang/cpat), [GeneMark-ST](https://exon.gatech.edu/), and [TransDecoder](https://github.com/TransDecoder/TransDecoder). 
 
 <img src="docs/images/isoPropeller_annotate.png" style="zoom: 33%;" />
 
-The output file `MAP.gtf` will be used in the step. The output file `MAP_gencode.gtf` will contain the annotated information.
+As an example, the merged output file `MAP.gtf` produced in the previous section will be annotated in this step. The resulting output file `MAP_gencode.gtf` will contain the annotations.
 
 ```bash
 perl isoPropeller_annotate -q MAP.gtf -r gencode.v41.annotation.gtf -o MAP_gencode.gtf -e /sc/arion/projects/EPIASD/IsoSeq_ourdata/NIAP_merged/MAP_cleaned_unfiltered_tss.bed -t <number of threads>
 ```
 
-In order to extract the annotation, the block below can be used.
+The code block below can be used to extract a summary of the annotations.
 
 ```bash
 for attribute in `echo ref_transcript_id asm_gene_id ref_gene_id gene_type gene_name status`; do echo $attribute; done > temp_attribute_list.txt
