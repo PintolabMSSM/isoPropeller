@@ -1,3 +1,7 @@
+[![Anaconda Install](https://img.shields.io/conda/dn/pintod02/isopropeller?label=Anaconda%20Install&color=44A833&logo=anaconda)](https://anaconda.org/pintod02/isopropeller)
+![Perl Version](https://img.shields.io/badge/perl-5.32.1-blue.svg?logo=perl&logoColor=white)
+[![License: MIT](https://img.shields.io/github/license/PintolabMSSM/isoPropeller?color=yellow)](https://github.com/PintolabMSSM/isoPropeller/blob/main/LICENSE)
+
 ## IsoPropeller
 
 This repository is part of a suite of three interconnected repositories that together form the **isoPropeller** computational framework for the analysis of long-read RNA-seq data:
@@ -192,3 +196,14 @@ for attribute in `echo ref_transcript_id asm_gene_id ref_gene_id gene_type gene_
 perl gtf2summary.pl -i MAP_gencode.gtf -o MAP_gencode -a temp_attribute_list.txt -j merged-intropolis-PEC-GTEX-owndata.SJ.out.tab -r -t <number of threads>
 ```
 
+## Contributors
+The IsoPropeller core tools and snakemake workflows are developped and maintained by [Xiao Lin](https://github.com/alanlamsiu), [Yoav Hadas](https://github.com/yoavhadas), and [Dalila Pinto](https://github.com/ddpinto) at the Icahn School of Medicine at Mount Sinai.
+If you want to contribute, please leave an issue. Thank you.
+
+The source code is available under the GPL3.0 license.
+
+## Citation
+The paper describing isoPropeller is in preparation. Stay tuned!
+
+## Feedback and bug reports
+We welcome your comments, bug reports, and suggestions. They will help us to further improve IsoPropeller. You may submit feedback and bug reports through our GitHub repository issue tracker.
