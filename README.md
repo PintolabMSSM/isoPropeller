@@ -1,6 +1,6 @@
 [![Anaconda Install](https://img.shields.io/conda/dn/pintod02/isopropeller?label=Anaconda%20Install&color=44A833&logo=anaconda)](https://anaconda.org/pintod02/isopropeller)
 ![Perl Version](https://img.shields.io/badge/perl-5.32.1-blue.svg?logo=perl&logoColor=white)
-[![License: MIT](https://img.shields.io/github/license/PintolabMSSM/isoPropeller?color=yellow)](https://github.com/PintolabMSSM/isoPropeller/blob/main/LICENSE)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
 ## IsoPropeller
 
