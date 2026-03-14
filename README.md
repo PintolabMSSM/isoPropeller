@@ -4,7 +4,8 @@
 
 ## IsoPropeller
 
-<img src="docs/images/IsoPropeller_logo.png" alt="Isopropeller" />This repository is part of a suite of three interconnected repositories that together form the **isoPropeller** computational framework for the analysis of long-read RNA-seq data:
+<img align="right" src="docs/images/IsoPropeller_logo.png" alt="IsoPropeller Logo" width="150">
+This repository is part of a suite of three interconnected repositories that together form the **isoPropeller** computational framework for the analysis of long-read RNA-seq data:
 
 - **isoPropeller**: The core standalone command-line utilities.
 - **isoPropeller-collapse**: Snakemake workflow for read processing, RNA isoform discovery, and QC.  
