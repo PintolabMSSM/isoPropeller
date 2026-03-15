@@ -4,7 +4,9 @@
 
 ## IsoPropeller
 
+<div>
 <img align="left" src="docs/images/IsoPropeller_logo.png" alt="IsoPropeller Logo" width="150">
+</div>
 
 This repository is part of a suite of three interconnected repositories that together form the **isoPropeller** computational framework for the analysis of long-read RNA-seq data:
 
