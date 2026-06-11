@@ -13,6 +13,7 @@ Change log:
 	v1.8	2023-09	Restructured the code. Added the option to provide genome fasta file for filtering intrapriming and 5' support bed file for filtering monoexonic reads.
 	v1.8.2	2023-09	Use a hash for storing the 5' support data instead of tabix.
 	v1.8.3	2024-09	Fixed the bed file coordinate issue. Added an option to rescue predicted intrapriming reads ending in annotated exons.
+	v1.9	2026-06 Replaced intron GTF input to the STAR SJ.out.tab format and used the sum of n_uniquely_mapped and n_multi_mapped as coverage.
 =cut
 
 use strict;
@@ -25,19 +26,18 @@ use threads;
 
 my $total_start_time = Benchmark->new;
 
-my $version = "v1.8.3";
+my $version = "v1.9";
 
-my ($bam, $out, $prefix, $mapq, $stp, $num_thread, $junc, $in_junc, $min_junc_dist, $junc_dist, $end_dist, $polya, $genome, $window, $frac_a_min, $length_a_min, $fprime, $fprime_dist, $ipr, $chr_list, $help) = ("", "", "isoPropeller", 0, "samtools", 1, "", 0, 10, 0, 0, "", "", 20, 0.6, 6, "", 100, "", "", 0);
+my ($bam, $out, $prefix, $mapq, $stp, $num_thread, $junc, $min_junc_dist, $junc_dist, $end_dist, $polya, $genome, $window, $frac_a_min, $length_a_min, $fprime, $fprime_dist, $ipr, $chr_list, $help) = ("", "", "isoPropeller", 0, "samtools", 1, "", 10, 0, 0, "", "", 20, 0.6, 6, "", 100, "", "", 0);
 
 my $usage="Usage: isoPropeller
-	-i <String> Input bam file (Required)
+	-i <String> Input BAM file (Required)
 	-o <String> Output base (Required)
 	-p <String> The prefix of gene and transcirpt IDs (Default: isoPropeller)
 	-q <Integer> Minimal mapping quality (Inclusive; default: $mapq)
 	-s <String> The path to samtools (samtools >= 1.11, default: \${PATH}/samtools)
 	-t <Integer> The number of threads to use (Default: $num_thread)
-	-x <String> The gtf file specifying splice junctions used for correction. An optional attribute, depth, can be included.
-	-j <Boolean> The intervals of splice junctions specified by -x are introns. (Default: false for exons as input)
+	-x <String> The SJ.out.tab file specifying splice junctions used for correction. An optional attribute, depth, can be included.
 	-m <Int> The minimal distance for splice junction correction (Default: $min_junc_dist, empirical)
 	-d <Boolean> Output the distance of splice junction between the prediction and the reference (Default: false)
 	-e <Boolean> Output the distribution of the 5' and 3' end position for each transcript (Default: false)
@@ -46,9 +46,9 @@ my $usage="Usage: isoPropeller
 	-w <Integer> The window size for intrapriming filtering (Default: $window)
 	-r <Float> Minimal fraction of \"A\"s to be considered as intrapriming (Default: $frac_a_min)
 	-v <Integer> The minial legnth of consecutive \"A\"s to be considered as inrapriming (Default: $length_a_min)
-	-f <String> The bed file of 5' support
+	-f <String> The BED file of 5' support
 	-k <Integer> Minimal distance to 5' support (Default: $fprime_dist)
-	-l <String> The bed file of valid regions for intrapriming
+	-l <String> The BED file of valid regions for intrapriming
 	-c <String> The list of chromosomes to be included
 	-h <Boolean> Help
 ";
@@ -61,7 +61,6 @@ GetOptions(
 	's=s'	=>	\$stp,
 	't=i'	=>	\$num_thread,
 	'x=s'	=>	\$junc,
-	'j!'	=>	\$in_junc,
 	'm=i'	=>	\$min_junc_dist,
 	'd!'	=>	\$junc_dist,
 	'e!'	=>	\$end_dist,
@@ -121,10 +120,6 @@ if($junc){
 		print STDERR "$junc does not exists!\n$usage";
 		exit;
 	}
-}
-if($in_junc){
-	print $log_fh " -j";
-	print $out_fh " -j";
 }
 if($junc_dist){
 	print $log_fh " -d";
@@ -285,7 +280,7 @@ my @running = ();
 while(@thread < @$chr_ref){
 	@running = threads->list(threads::running);
 	if(@running < $num_thread){
-		my $thread = threads->create(\&worker, $log_fh, $chr_ref->[$chr_pos], $dir, $mapq, $prefix, $min_junc_dist, $junc, $in_junc, $junc_dist, $end_dist, $polya, $genome, $window, $frac_a_min, $length_a_min, $fprime, $fprime_dist, $ipr, $stp);
+		my $thread = threads->create(\&worker, $log_fh, $chr_ref->[$chr_pos], $dir, $mapq, $prefix, $min_junc_dist, $junc, $junc_dist, $end_dist, $polya, $genome, $window, $frac_a_min, $length_a_min, $fprime, $fprime_dist, $ipr, $stp);
 		push(@thread, $thread);
 		$chr_pos++;
 	}
@@ -339,7 +334,7 @@ chomp $date;
 print $log_fh "[$date]\tTotal time used: ". timestr($total_time_spent) . "\n";
 
 sub worker{
-	my ($temp_log_fh, $temp_chr, $temp_dir, $temp_mapq, $temp_prefix, $temp_min_junc_dist, $temp_junc, $temp_in_junc, $temp_junc_dist, $temp_end_dist, $temp_polya, $temp_genome, $temp_window, $temp_frac_a_min, $temp_length_a_min, $temp_fprime, $temp_fprime_dist, $temp_ipr, $temp_stp) = @_;
+	my ($temp_log_fh, $temp_chr, $temp_dir, $temp_mapq, $temp_prefix, $temp_min_junc_dist, $temp_junc, $temp_junc_dist, $temp_end_dist, $temp_polya, $temp_genome, $temp_window, $temp_frac_a_min, $temp_length_a_min, $temp_fprime, $temp_fprime_dist, $temp_ipr, $temp_stp) = @_;
 	my $temp_date_format = "+%F-%T.%3N";
 	my $temp_date = `date $temp_date_format`;
 	chomp $temp_date;
@@ -358,7 +353,7 @@ sub worker{
 	my %temp_read = ();
 
 	if($temp_junc){
-		read_ref_eej("${temp_dir}/${temp_chr}_eej.gtf", $temp_in_junc, \%temp_ref_eej_array, \%temp_ref_eej_hash);
+		read_ref_eej("${temp_dir}/${temp_chr}_SJ.out.tab", \%temp_ref_eej_array, \%temp_ref_eej_hash);
 	}
 	if($temp_polya){
 		read_polya("${temp_dir}/${temp_chr}_polya.txt", \%temp_polya);
@@ -493,7 +488,7 @@ sub split_bam{
 sub split_ref_eej{
 	my ($temp_chr_ref, $temp_dir, $temp_junc) = @_;
 	foreach my $temp_chr (@$temp_chr_ref){
-		system("grep \"^$temp_chr\"\$\'\\t\' $temp_junc > ${temp_dir}/${temp_chr}_eej.gtf");
+		system("grep \"^$temp_chr\"\$\'\\t\' $temp_junc > ${temp_dir}/${temp_chr}_SJ.out.tab");
 	}
 
 	return 1;
@@ -627,35 +622,38 @@ sub print_stat{
 	return 1;
 }
 
-#Read the splice junction gtf file if provided.
+#Read the splice junction BED file if provided.
 sub read_ref_eej{
-	my ($temp_junc, $temp_in_junc, $temp_ref_eej_array_ref, $temp_ref_eej_hash_ref) = @_;
+	my ($temp_junc, $temp_ref_eej_array_ref, $temp_ref_eej_hash_ref) = @_;
 	open(my $temp_fh, $temp_junc) or die "<ERROR> Cannot open $temp_junc!\n";
 	while(<$temp_fh>){
 		chomp;
 		my $temp_line = $_;
 		$temp_line =~ s/\r//;
 		my @temp_line = split('\t', $temp_line);
-		unless(exists $temp_ref_eej_array_ref->{$temp_line[6]}){
-			@{$temp_ref_eej_array_ref->{$temp_line[6]}} = ();
-			%{$temp_ref_eej_hash_ref->{$temp_line[6]}} = ();
+		my $temp_strand;
+		if($temp_line[3] == 1){
+			$temp_strand = '+';
 		}
-		my $temp_depth = 0;
-		if($temp_line[8] =~ /depth \"(\d+)\"\;/){
-			$temp_depth = $1;
+		elsif($temp_line[3] == 2){
+			$temp_strand = '-';
 		}
-		if($temp_in_junc){
-			$temp_line[3] -= 1;
-			$temp_line[4] += 1;
+		else{
+			next;
 		}
-		my @temp_ref_eej = ($temp_line[3], $temp_line[4], $temp_depth);
-		#print "$temp_line[0]\t$temp_line[6]\t$temp_line[3]\t$temp_line[4]\t$temp_depth\n";
-		push(@{$temp_ref_eej_array_ref->{$temp_line[6]}}, \@temp_ref_eej);
-		unless(exists $temp_ref_eej_hash_ref->{$temp_line[6]}{$temp_line[3]}){
-			%{$temp_ref_eej_hash_ref->{$temp_line[6]}{$temp_line[3]}} = ();
+		unless(exists $temp_ref_eej_array_ref->{$temp_strand}){
+			@{$temp_ref_eej_array_ref->{$temp_strand}} = ();
+			%{$temp_ref_eej_hash_ref->{$temp_strand}} = ();
 		}
-		unless(exists $temp_ref_eej_hash_ref->{$temp_line[6]}{$temp_line[3]}{$temp_line[4]}){
-			$temp_ref_eej_hash_ref->{$temp_line[6]}{$temp_line[3]}{$temp_line[4]} = $temp_depth;
+		$temp_line[1] -= 1;
+		$temp_line[2] += 1;
+		my @temp_ref_eej = ($temp_line[1], $temp_line[2], $temp_line[4], $temp_line[5], $temp_line[6], $temp_line[7], $temp_line[8]);
+		push(@{$temp_ref_eej_array_ref->{$temp_strand}}, \@temp_ref_eej);
+		unless(exists $temp_ref_eej_hash_ref->{$temp_strand}{$temp_line[1]}){
+			%{$temp_ref_eej_hash_ref->{$temp_strand}{$temp_line[1]}} = ();
+		}
+		unless(exists $temp_ref_eej_hash_ref->{$temp_strand}{$temp_line[1]}{$temp_line[2]}){
+			$temp_ref_eej_hash_ref->{$temp_strand}{$temp_line[1]}{$temp_line[2]} = \@temp_ref_eej;
 		}
 	}
 
@@ -1215,10 +1213,10 @@ sub find_nearest{
 				foreach my $temp_left (keys %temp_left){
 					foreach my $temp_right (keys %temp_right){
 						if(exists $temp_db_hash_ref->{$temp_left}{$temp_right}){
-							if($temp_db_hash_ref->{$temp_left}{$temp_right} > $temp_coverage){
+							if(($temp_db_hash_ref->{$temp_left}{$temp_right}[4] + $temp_db_hash_ref->{$temp_left}{$temp_right}[5]) > $temp_coverage){
 								@temp_nearest_splice_site = ($temp_left, $temp_right, $temp_db_hash_ref->{$temp_left}{$temp_right});
 								$temp_nearest_dist = $temp_dist;
-								$temp_coverage = $temp_db_hash_ref->{$temp_left}{$temp_right};
+								$temp_coverage = ($temp_db_hash_ref->{$temp_left}{$temp_right}[4] + $temp_db_hash_ref->{$temp_left}{$temp_right}[5]);
 							}
 						}
 					}
@@ -1233,10 +1231,10 @@ sub find_nearest{
 	if($temp_nearest_dist eq "NA"){
 		foreach my $temp_db (@{$temp_db_array_ref}){
 			my $temp_dist = abs($temp_query_ref->[0] - $temp_db->[0]) + abs($temp_query_ref->[1] - $temp_db->[1]);
-			if(($temp_dist < $temp_nearest_dist) || (($temp_dist == $temp_nearest_dist) && ($temp_db->[2] > $temp_coverage)) || ($temp_nearest_dist eq "NA")){
+			if(($temp_dist < $temp_nearest_dist) || (($temp_dist == $temp_nearest_dist) && (($temp_db->[4] + $temp_db->[5]) > $temp_coverage)) || ($temp_nearest_dist eq "NA")){
 				@temp_nearest_splice_site = @{$temp_db};
 				$temp_nearest_dist = $temp_dist;
-				$temp_coverage = $temp_db->[2];
+				$temp_coverage = ($temp_db->[4] + $temp_db->[5]);
 			}
 		}
 	}
