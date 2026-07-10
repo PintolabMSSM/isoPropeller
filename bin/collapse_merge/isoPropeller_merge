@@ -9,6 +9,8 @@ Change log:
 	v1.4	2022-08	Added a step to further divide a locus into sub-loci based on exon overlapping and splice site matching.
 	v1.5	2022-09	Enabled multithreading.
 	v1.6	2023-09	Restructured the code.
+	v1.6.2	2026-07	Modified merge_loci and merge_transcript to improve run time.
+	v1.6.3	2026-07	Modified locus_sub_cluster and removed compare_transcript to improve run time.
 =cut
 
 use strict;
@@ -19,26 +21,24 @@ use Benchmark qw(:hireswallclock);
 
 my $total_start_time = Benchmark->new;
 
-my $version = "v1.6";
+my $version = "v1.6.3";
 
 my $usage = "Usage: perl isoPropeller_merge
 	-i <String> Input list of .gtf file(s)
 	-o <String> Output base
 	-e <String> The atribute for the getting expression value (cov, FPKM, TPM and etc.)
-	-p <String> The prefix of gene and transcript IDs (Default: isoPropeller)
-	-b <String> The path to bedtools
+	-p <String> The prefix of gene and transcript IDs (Default: NIAP)
 	-t <Integer> Number of threads (Default: 1)
 	-h <Boolean> Help
 ";
 
-my ($in, $out, $exp, $prefix, $btp, $num_thread, $help) = ("", "", "", "isoPropeller", "", 1, 0);
+my ($in, $out, $exp, $prefix, $num_thread, $help) = ("", "", "", "ISOP", 1, 0);
 
 GetOptions(
 	'i=s'	=>	\$in,
 	'o=s'	=>	\$out,
 	'e=s'	=>	\$exp,
 	'p=s'	=>	\$prefix,
-	'b=s'	=>	\$btp,
 	't=i'	=>	\$num_thread,
         'h!'    =>      \$help,
 );
@@ -46,16 +46,6 @@ GetOptions(
 if($help){
         print "$usage";
         exit;
-}
-
-unless($btp){
-	$btp = "bedtools";
-}
-
-unless(`which $btp`){
-	print "Incorrect path for bedtools!\n";
-	print "$usage";
-	exit;
 }
 
 unless($in && $out){
@@ -67,8 +57,8 @@ open(my $out_fh, "> ${out}.gtf") or die "<ERROR> Cannot create ${out}.gtf!\n";
 my $date_format = "+%F-%T.%3N";
 my $date = `date $date_format`;
 chomp $date;
-print "[isoPropeller_merge $date]\tperl isoPropeller_merge_${version}.pl -i $in -o $out -p $prefix -b $btp -t $num_thread";
-print $out_fh "#perl isoPropeller_merge_${version}.pl -i $in -o $out -p $prefix -b $btp -t $num_thread";
+print "[isoPropeller_merge $date]\tperl isoPropeller_merge_${version}.pl -i $in -o $out -p $prefix -t $num_thread";
+print $out_fh "#perl isoPropeller_merge_${version}.pl -i $in -o $out -p $prefix -t $num_thread";
 if($exp){
 	print " -e $exp";
 	print $out_fh " -e $exp";
@@ -83,7 +73,7 @@ if(-d $dir){
 	system("rm ${dir}/*");
 }
 else{
-	system("mkdir -p $dir");
+	system("mkdir $dir");
 }
 
 my $total_thread = `grep -c \"^processor\" /proc/cpuinfo`;
@@ -372,183 +362,72 @@ sub add_transcript{
 
 #Sort loci
 sub merge_loci{
-	my ($temp_num_sample, $temp_sref, $temp_start) = @_;
+	my ($temp_num_sample, $temp_sref) = @_;
 
-	if(!defined $temp_start){
-		@{$temp_sref} = sort { $a->[0] <=> $b->[0] || $a->[1] <=> $b->[1] } @{$temp_sref};
-		$temp_start = 0;
-		my $temp_size = @{$temp_sref};
-#		print "Start merging a list of $temp_size locus...\n";
-	}
-	my $temp_last = $temp_sref->[$temp_start];
-	$temp_start++;
+	my @temp_sorted = sort { $a->[0] <=> $b->[0] || $a->[1] <=> $b->[1] } grep { @{$_} } @{$temp_sref};
+	my @temp_result = ();
+	my $temp_last;
 
-	if(@{$temp_last}){
-		for(my $i = $temp_start; $i < @{$temp_sref}; $i++){
-			my $temp_cur = $temp_sref->[$i];
-#			print "Merging loci $i:@{$temp_cur} with loci $temp_start:@{$temp_last}...\n";
-			if(!@{$temp_cur}){
-#				print "Empty loci. Skip...\n";
-				next;
+	foreach my $temp_cur (@temp_sorted){
+		if(defined $temp_last && $temp_cur->[0] >= $temp_last->[0] && $temp_cur->[0] <= $temp_last->[1]){
+			if($temp_cur->[1] > $temp_last->[1]){
+				$temp_last->[1] = $temp_cur->[1];
 			}
-
-			if(($temp_cur->[0] >= $temp_last->[0]) && ($temp_cur->[0] <= $temp_last->[1])){
-#				print "Found overlap!\n";
-				if ($temp_cur->[1] > $temp_last->[1]){
-					$temp_last->[1] = $temp_cur->[1];
+			foreach my $temp_cur_eej (keys %{$temp_cur->[2]}){
+				if(exists $temp_last->[2]{$temp_cur_eej}){
+					push(@{$temp_last->[2]{$temp_cur_eej}}, @{$temp_cur->[2]{$temp_cur_eej}});
+					@{$temp_last->[2]{$temp_cur_eej}} = merge_transcript($temp_num_sample, $temp_last->[2]{$temp_cur_eej});
 				}
-				
-				foreach my $temp_cur_eej (keys %{$temp_cur->[2]}){
-#					print "Cur EEJ:$temp_cur_eej\n";
-					if(exists $temp_last->[2]{$temp_cur_eej}){
-#						print "Exists in last\n";
-						push(@{$temp_last->[2]{$temp_cur_eej}}, @{$temp_cur->[2]{$temp_cur_eej}});
-#						print "@{$temp_last->[2]{$temp_cur_eej}}\n";
-						foreach my $temp_transcript (@{$temp_last->[2]{$temp_cur_eej}}){
-#							print "@{$temp_transcript}\n";
-							my @temp_id = keys %{$temp_transcript->[3]};
-#							print "@temp_id\n";
-						}
-						my @temp_new_transcript = merge_transcript($temp_num_sample, $temp_last->[2]{$temp_cur_eej});
-						@{$temp_last->[2]{$temp_cur_eej}} = @temp_new_transcript;
-					}
-					else{
-#						print "Not exist\nAdd:@{$temp_cur->[2]{$temp_cur_eej}}\n";
-#						foreach my $j (@{$temp_cur->[2]{$temp_cur_eej}}){
-#							print "@{$j}\n";
-#						}
-						@{$temp_last->[2]{$temp_cur_eej}} = merge_transcript($temp_num_sample, $temp_cur->[2]{$temp_cur_eej});
-#						print "New last EEJ:@{$temp_last->[2]{$temp_cur_eej}->[0]}\n";
-					}
+				else{
+					@{$temp_last->[2]{$temp_cur_eej}} = merge_transcript($temp_num_sample, $temp_cur->[2]{$temp_cur_eej});
 				}
-#				print "Clearing the current loci $i...\n";
-				@{$temp_cur} = ();
-			}
-			else{
-				$temp_start = $i;
-#				print "No overlap found.\n";
-				last;
 			}
 		}
+		else{
+			#No overlap: the current locus opens a new cluster
+			push(@temp_result, $temp_last) if defined $temp_last;
+			$temp_last = $temp_cur;
+		}
 	}
-	if($temp_start < @{$temp_sref}){
-#		print "Skip to loci $temp_start as a new start...\n";
-		merge_loci($temp_num_sample, $temp_sref, $temp_start);
-	}
+	push(@temp_result, $temp_last) if defined $temp_last;
 
-	return sort { $a->[0] <=> $b->[0] || $a->[1] <=> $b->[1] } map { @{$_} ? $_ : () } @{$temp_sref};
+	return @temp_result;
 }
 
-#
 
 #Merge transcripts with the same exon-exon junction in the same locus
 sub merge_transcript{
-	my ($temp_num_sample, $temp_sref, $temp_start) = @_;
-	if(!defined $temp_start){
-		@{$temp_sref} = sort { $a->[0] <=> $b->[0] || $a->[1] <=> $b->[1] } @{$temp_sref};
-		$temp_start = 0;
-		my $temp_size = @{$temp_sref};
-#		print "\tStart merging a list of $temp_size transcripts...\n";
-	}
-	my $temp_last = $temp_sref->[$temp_start];
-	$temp_start++;
-
-	if(@{$temp_last}){
-		for(my $i = $temp_start; $i < @{$temp_sref}; $i++){
-			my $temp_cur = $temp_sref->[$i];
-#			print "\tMerging transcript $i:@{$temp_cur} with $temp_start:@{$temp_last}...\n";
-			if(!@{$temp_cur}){
-#				print "\tEmpty transcript. Skip...\n";
-				next;
+	my ($temp_num_sample, $temp_sref) = @_;
+	my @temp_sorted = sort { $a->[0] <=> $b->[0] || $a->[1] <=> $b->[1] } grep { @{$_} } @{$temp_sref};
+	my @temp_result = ();
+	my $temp_last;
+	foreach my $temp_cur (@temp_sorted){
+		if(defined $temp_last && $temp_cur->[0] >= $temp_last->[0] && $temp_cur->[0] <= $temp_last->[1]){
+			if($temp_cur->[1] > $temp_last->[1]){
+				$temp_last->[1] = $temp_cur->[1];
 			}
-
-			if (($temp_cur->[0] >= $temp_last->[0]) && ($temp_cur->[0] <= $temp_last->[1])){
-#				print "\tFound overlap!\n";
-				if ($temp_cur->[1] > $temp_last->[1]){
-					$temp_last->[1] = $temp_cur->[1];
-				}
-				my @temp_last_exp = @{$temp_last->[2]};
-				my @temp_cur_exp = @{$temp_cur->[2]};
-				for(my $j = 0; $j < $temp_num_sample; $j++){
-					$temp_last_exp[$j] += $temp_cur_exp[$j];
-				}
-				@{$temp_last->[2]} = @temp_last_exp;
-				my %temp_last_tid = %{$temp_last->[3]};
-				my %temp_cur_tid = %{$temp_cur->[3]};
-				#my @temp_id = keys %{$temp_last->[3]};
-#				print "\tTranscript $temp_start: $temp_last->[0]-$temp_last->[1], @temp_id\n";
-				#@temp_id = keys %{$temp_cur->[3]};
-#				print "\tTranscript $i: $temp_cur->[0]-$temp_cur->[1], @temp_id\n";
-				foreach my $temp_tid (keys %temp_cur_tid){
-					unless(exists $temp_last_tid{$temp_tid}){
-						$temp_last_tid{$temp_tid} = 1;
-					}
-				}
-				%{$temp_last->[3]} = %temp_last_tid;
-				my %temp_last_ends = %{$temp_last->[4]};
-				my %temp_cur_ends = %{$temp_cur->[4]};
-				foreach my $temp_ends (keys %temp_cur_ends){
-					unless(exists $temp_last_ends{$temp_ends}){
-						$temp_last_ends{$temp_ends} = 0;
-					}
-					$temp_last_ends{$temp_ends}++;
-				}
-				%{$temp_last->[4]} = %temp_last_ends;
-#				print "\tClearing the current transcript $i...\n";
-				@{$temp_cur} = ();
+			#Sum expression per sample
+			for(my $j = 0; $j < $temp_num_sample; $j++){
+				$temp_last->[2][$j] += $temp_cur->[2][$j];
 			}
-			else{
-				$temp_start = $i;
-#				print "\tNo overlap found.\n";
-				last;
+			#Union of original transcript IDs
+			foreach my $temp_tid (keys %{$temp_cur->[3]}){
+				$temp_last->[3]{$temp_tid} = 1 unless exists $temp_last->[3]{$temp_tid};
+			}
+			#Tally end positions (one increment per distinct end seen in the current transcript)
+			foreach my $temp_ends (keys %{$temp_cur->[4]}){
+				$temp_last->[4]{$temp_ends} = 0 unless exists $temp_last->[4]{$temp_ends};
+				$temp_last->[4]{$temp_ends}++;
 			}
 		}
-	}
-	if($temp_start < @{$temp_sref}){
-#		print "\tSkip to transcript $temp_start as a new start...\n";
-		merge_transcript($temp_num_sample, $temp_sref, $temp_start);
-	}
-
-	return sort { $a->[0] <=> $b->[0] || $a->[1]<=>$b->[1] } map { @{$_} ? $_ : () } @{$temp_sref};
-}
-
-#Compare two transcripts using their exon-exon junction chains and report whether they belong to the same sub-locus
-sub compare_transcript{
-	my ($temp_transcript_a, $temp_transcript_b) = @_;
-	my @temp_transcript_a = split(',', $temp_transcript_a);
-	my $temp_num_exon_a = @temp_transcript_a;
-	my @temp_transcript_b = split(',', $temp_transcript_b);
-	my $temp_num_exon_b = @temp_transcript_b;
-	for(my $i = 0; $i < $temp_num_exon_a; $i++){
-		my @temp_exon_a = split('-', $temp_transcript_a[$i]);
-		for(my $j = 0; $j < $temp_num_exon_b; $j++){
-			my @temp_exon_b = split('-', $temp_transcript_b[$j]);
-			if(($temp_num_exon_a == 1) || ($temp_num_exon_b == 1)){
-				if((($temp_exon_a[0] >= $temp_exon_b[0]) && ($temp_exon_a[0] <= $temp_exon_b[1])) || (($temp_exon_b[0] >= $temp_exon_a[0]) && ($temp_exon_b[0] <= $temp_exon_a[1]))){
-					return 1;
-				}
-			}
-			else{
-				if(($i == 0) || ($j == 0)){
-					if($temp_exon_a[1] == $temp_exon_b[1]){
-						return 1;
-					}
-				}
-				elsif(($i == ($temp_num_exon_a - 1)) || ($j == ($temp_num_exon_b - 1))){
-					if($temp_exon_a[0] == $temp_exon_b[0]){
-						return 1;
-					}
-				}
-				else{
-					if(($temp_exon_a[0] == $temp_exon_b[0]) || ($temp_exon_a[1] == $temp_exon_b[1])){
-						return 1;
-					}
-				}
-			}
+		else{
+			push(@temp_result, $temp_last) if defined $temp_last;
+			$temp_last = $temp_cur;
 		}
 	}
+	push(@temp_result, $temp_last) if defined $temp_last;
 
-	return 0;
+	return @temp_result;
 }
 
 #Find the representative transcript in the corresponding sub-locus
@@ -596,7 +475,7 @@ sub merge_sub_loci{
 	return 1;
 }
 
-#Divide a locus into sub-loci
+#Divide a locus into sub-loci via a splice-site index (replaces the all-pairs scan)
 sub locus_sub_cluster{
 	my ($temp_locus_ref) = @_;
 	my %temp_rep_transcript = ();
@@ -604,32 +483,66 @@ sub locus_sub_cluster{
 	my %temp_rep_region = ();
 	my %temp_sub_loci = ();
 	my %temp_sub_loci_region = ();
+	my %temp_exons = ();     #key -> arrayref of [l,r], pre-split once
+	my @temp_single = ();    #single-exon transcript keys
+	my %temp_donor = ();     #internal right-boundary coord -> [keys]
+	my %temp_acceptor = ();  #internal left-boundary coord  -> [keys]
+
 	foreach my $temp_eej (sort keys %{$temp_locus_ref->[2]}){
 		foreach my $temp_transcript (@{$temp_locus_ref->[2]{$temp_eej}}){
 			my $temp_eej_new = $temp_transcript->[0]. $temp_eej . $temp_transcript->[1];
-			unless(exists $temp_rep_region{$temp_eej_new}){
-				@{$temp_rep_region{$temp_eej_new}} = ($temp_transcript->[0], $temp_transcript->[1]);
+			next if exists $temp_rep_transcript{$temp_eej_new};   #distinct keys only
+			@{$temp_rep_region{$temp_eej_new}} = ($temp_transcript->[0], $temp_transcript->[1]);
+			$temp_rep_transcript{$temp_eej_new} = $temp_eej_new;
+			$temp_sub_loci_size{$temp_eej_new} = 1;
+			$temp_sub_loci{$temp_eej_new} = 0;
+			my @temp_ex = map { [split '-', $_] } split(',', $temp_eej_new);
+			$temp_exons{$temp_eej_new} = \@temp_ex;
+			my $temp_k = @temp_ex;
+			if($temp_k == 1){
+				push(@temp_single, $temp_eej_new);
 			}
-			unless(exists $temp_rep_transcript{$temp_eej_new}){
-				$temp_rep_transcript{$temp_eej_new} = $temp_eej_new;
-			}
-			unless(exists $temp_sub_loci_size{$temp_eej_new}){
-				$temp_sub_loci_size{$temp_eej_new} = 1;
-			}
-			unless(exists $temp_sub_loci{$temp_eej_new}){
-				$temp_sub_loci{$temp_eej_new} = 0;
+			else{
+				#Donors: right coord of every exon except the last
+				for(my $i = 0; $i < $temp_k - 1; $i++){
+					push(@{$temp_donor{$temp_ex[$i][1]}}, $temp_eej_new);
+				}
+				#Acceptors: left coord of every exon except the first
+				for(my $i = 1; $i < $temp_k; $i++){
+					push(@{$temp_acceptor{$temp_ex[$i][0]}}, $temp_eej_new);
+				}
 			}
 		}
 	}
-	my @temp_transcript = keys %temp_sub_loci;
-	my $temp_num_transcript = @temp_transcript;
-	for(my $i = 0; $i < ($temp_num_transcript - 1); $i++){
-		for(my $j = ($i + 1); $j < $temp_num_transcript; $j++){
-			if(compare_transcript($temp_transcript[$i], $temp_transcript[$j])){
-				merge_sub_loci(\%temp_rep_transcript, \%temp_sub_loci_size, \%temp_rep_region, $temp_transcript[$i], $temp_transcript[$j]);
+	#Union multi-exon transcripts sharing an internal splice site
+	foreach my $temp_index (\%temp_donor, \%temp_acceptor){
+		foreach my $temp_coord (keys %{$temp_index}){
+			my $temp_list = $temp_index->{$temp_coord};
+			for(my $i = 1; $i < @{$temp_list}; $i++){
+				merge_sub_loci(\%temp_rep_transcript, \%temp_sub_loci_size, \%temp_rep_region, $temp_list->[0], $temp_list->[$i]);
 			}
 		}
 	}
+	#Union single-exon transcripts with anything their interval overlaps
+	if(@temp_single){
+		my @temp_all_exon = ();
+		foreach my $temp_key (keys %temp_exons){
+			foreach my $temp_ex (@{$temp_exons{$temp_key}}){
+				push(@temp_all_exon, [$temp_ex->[0], $temp_ex->[1], $temp_key]);
+			}
+		}
+		@temp_all_exon = sort { $a->[0] <=> $b->[0] } @temp_all_exon;
+		foreach my $temp_s (@temp_single){
+			my ($temp_sl, $temp_sr) = @{$temp_exons{$temp_s}[0]};
+			foreach my $temp_ex (@temp_all_exon){
+				last if $temp_ex->[0] > $temp_sr;   #sorted by start: no further overlaps
+				next if $temp_ex->[1] < $temp_sl;   #ends before the single-exon starts
+				next if $temp_ex->[2] eq $temp_s;   #skip self
+				merge_sub_loci(\%temp_rep_transcript, \%temp_sub_loci_size, \%temp_rep_region, $temp_s, $temp_ex->[2]);
+			}
+		}
+	}
+	#Assign sub-locus numbers (unchanged from the original)
 	my $temp_sub_loci_count = 0;
 	foreach my $temp_transcript (sort {$temp_rep_region{$a}[0] <=> $temp_rep_region{$b}[0]} keys %temp_rep_region){
 		if($temp_transcript eq $temp_rep_transcript{$temp_transcript}){
@@ -665,7 +578,7 @@ sub print_gtf_exp{
 			my ($temp_sub_loci_ref, $temp_sub_loci_region_ref) = locus_sub_cluster($temp_locus);
 			#print "$temp_chr\t$temp_strand\t$temp_loci\n";
 			foreach my $temp_sub_locus (keys %$temp_sub_loci_region_ref){
-				print $temp_gtf_fh "$temp_chr\tisoPropeller\tgene\t$temp_sub_loci_region_ref->{$temp_sub_locus}->[0]\t$temp_sub_loci_region_ref->{$temp_sub_locus}->[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}_${temp_sub_locus}\"\;\n";
+				print $temp_gtf_fh "$temp_chr\tNIAP\tgene\t$temp_sub_loci_region_ref->{$temp_sub_locus}->[0]\t$temp_sub_loci_region_ref->{$temp_sub_locus}->[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}_${temp_sub_locus}\"\;\n";
 			}
 			my $temp_transcript_count = 1;
 			foreach my $temp_eej (sort keys %{$temp_locus->[2]}){
@@ -673,7 +586,7 @@ sub print_gtf_exp{
 					my $temp_eej_new = $temp_transcript->[0]. $temp_eej . $temp_transcript->[1];
 					my @temp_eej = split(',', $temp_eej_new);
 					my $temp_num_exon = @temp_eej;
-					print $temp_gtf_fh "$temp_chr\tisoPropeller\ttranscript\t$temp_transcript->[0]\t$temp_transcript->[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}_$temp_sub_loci_ref->{$temp_eej_new}\"\; transcript_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}.${temp_transcript_count}\"\;\n";
+					print $temp_gtf_fh "$temp_chr\tNIAP\ttranscript\t$temp_transcript->[0]\t$temp_transcript->[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}_$temp_sub_loci_ref->{$temp_eej_new}\"\; transcript_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}.${temp_transcript_count}\"\;\n";
 					for(my $i = 0; $i < $temp_num_exon; $i++){
 						my $temp_cur_exon_num;
 						my @temp_exon = split('-', $temp_eej[$i]);
@@ -685,7 +598,7 @@ sub print_gtf_exp{
 						else{
 							$temp_cur_exon_num = $i + 1;
 						}
-						print $temp_gtf_fh "$temp_chr\tisoPropeller\texon\t$temp_exon[0]\t$temp_exon[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}_$temp_sub_loci_ref->{$temp_eej_new}\"\; transcript_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}.${temp_transcript_count}\"\; exon_number \"$temp_cur_exon_num\"\;\n";
+						print $temp_gtf_fh "$temp_chr\tNIAP\texon\t$temp_exon[0]\t$temp_exon[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}_$temp_sub_loci_ref->{$temp_eej_new}\"\; transcript_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}.${temp_transcript_count}\"\; exon_number \"$temp_cur_exon_num\"\;\n";
 					}
 					if($temp_exp){
 						print $temp_exp_fh "${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}.${temp_transcript_count}";
