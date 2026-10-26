@@ -1,4 +1,4 @@
-#!/usr/bin/env perl
+#!/user/bin/env perl
 =start
 Author: ALin
 Purpose: To collapse RNA-seq long reads, perform splice junction correction based on the nearest splice junction provided by NGS or reference if available, and generate a .gtf file for all transcripts with unique structures.
@@ -13,7 +13,8 @@ Change log:
 	v1.8	2023-09	Restructured the code. Added the option to provide genome fasta file for filtering intrapriming and 5' support bed file for filtering monoexonic reads.
 	v1.8.2	2023-09	Use a hash for storing the 5' support data instead of tabix.
 	v1.8.3	2024-09	Fixed the bed file coordinate issue. Added an option to rescue predicted intrapriming reads ending in annotated exons.
-	v1.9	2026-06 Replaced intron GTF input to the STAR SJ.out.tab format and used the sum of n_uniquely_mapped and n_multi_mapped as coverage.
+	v1.9	2026-06	Replaced intron GTF input to the STAR SJ.out.tab format and used the sum of n_uniquely_mapped and n_multi_mapped as coverage.
+	v1.10	2026-10	Replaced the ithreads-based scheduler with a fork()-based worker pool. Fixed a bug in splitting chromosomes.
 =cut
 
 use strict;
@@ -22,18 +23,21 @@ use List::Util qw(max min);
 use Bio::Seq;
 use Bio::SeqIO;
 use Benchmark qw(:hireswallclock);
-use threads;
+use POSIX qw(:sys_wait_h);
+use Storable qw(nstore retrieve);
+
+$| = 1;
 
 my $total_start_time = Benchmark->new;
 
-my $version = "v1.9";
+my $version = "v1.10";
 
-my ($bam, $out, $prefix, $mapq, $stp, $num_thread, $junc, $min_junc_dist, $junc_dist, $end_dist, $polya, $genome, $window, $frac_a_min, $length_a_min, $fprime, $fprime_dist, $ipr, $chr_list, $help) = ("", "", "isoPropeller", 0, "samtools", 1, "", 10, 0, 0, "", "", 20, 0.6, 6, "", 100, "", "", 0);
+my ($bam, $out, $prefix, $mapq, $stp, $num_thread, $junc, $min_junc_dist, $junc_dist, $end_dist, $polya, $genome, $window, $frac_a_min, $length_a_min, $fprime, $fprime_dist, $ipr, $chr_list, $help) = ("", "", "ISOP", 0, "samtools", 1, "", 10, 0, 0, "", "", 20, 0.6, 6, "", 100, "", "", 0);
 
-my $usage="Usage: isoPropeller
+my $usage="Usage: perl isoPropeller_${version}.pl
 	-i <String> Input BAM file (Required)
 	-o <String> Output base (Required)
-	-p <String> The prefix of gene and transcirpt IDs (Default: isoPropeller)
+	-p <String> The prefix of gene and transcirpt IDs (Default: ISOP)
 	-q <Integer> Minimal mapping quality (Inclusive; default: $mapq)
 	-s <String> The path to samtools (samtools >= 1.11, default: \${PATH}/samtools)
 	-t <Integer> The number of threads to use (Default: $num_thread)
@@ -42,7 +46,7 @@ my $usage="Usage: isoPropeller
 	-d <Boolean> Output the distance of splice junction between the prediction and the reference (Default: false)
 	-e <Boolean> Output the distribution of the 5' and 3' end position for each transcript (Default: false)
 	-a <String> The output from nanopolish polya
-	-g <String> The genome .fa file for intrapriming filtering
+	-g <String> The genome FA file for intrapriming filtering
 	-w <Integer> The window size for intrapriming filtering (Default: $window)
 	-r <Float> Minimal fraction of \"A\"s to be considered as intrapriming (Default: $frac_a_min)
 	-v <Integer> The minial legnth of consecutive \"A\"s to be considered as inrapriming (Default: $length_a_min)
@@ -73,7 +77,7 @@ GetOptions(
 	'k=i'	=>	\$fprime_dist,
 	'l=s'	=>	\$ipr,
 	'c=s'	=>	\$chr_list,
-        'h!'    =>      \$help
+	'h!'	=>	\$help
 );
 
 if($help){
@@ -99,12 +103,13 @@ unless($bam && $out){
 
 if($junc_dist){
 	unless($junc){
-		print STDERR "<ERROR> Must specify -x with -d!\n$usage";
+		print STDERR "<ERROR> Must specify -junc with -junc_dist!\n$usage";
 		exit;
 	}
 }
 
 open(my $log_fh, "> ${out}.log") or die "<ERROR> Cannot create ${out}.log!\n";
+$log_fh->autoflush(1);
 open(my $out_fh, "> ${out}.gtf") or die "<ERROR> Cannot create ${out}.gtf!\n";
 my $date_format = "+%F-%T.%3N";
 my $date = `date $date_format`;
@@ -199,7 +204,7 @@ elsif(-e $dir){
 	exit;
 }
 else{
-	system("mkdir -p $dir");
+	system("mkdir $dir");
 }
 
 my $total_thread = `grep -c \"^processor\" /proc/cpuinfo`;
@@ -274,26 +279,65 @@ chomp $date;
 print $log_fh "[$date]\tPreprocessing done!\n";
 
 my $chr_pos = 0;
-my @thread = ();
-my @running = ();
+my %running_pid_to_chr = ();
+my $failed = 0;
+my %read = ();
 
-while(@thread < @$chr_ref){
-	@running = threads->list(threads::running);
-	if(@running < $num_thread){
-		my $thread = threads->create(\&worker, $log_fh, $chr_ref->[$chr_pos], $dir, $mapq, $prefix, $min_junc_dist, $junc, $junc_dist, $end_dist, $polya, $genome, $window, $frac_a_min, $length_a_min, $fprime, $fprime_dist, $ipr, $stp);
-		push(@thread, $thread);
-		$chr_pos++;
+#Reap a single finished child, pull its stats back in via Storable (fork()ed children
+#can't return Perl data structures the way threads->join() could), and update %read.
+sub reap_one{
+	my $temp_pid = waitpid(-1, 0);
+	return 0 if $temp_pid <= 0;
+	my $temp_status = $?;
+	my $temp_chr = delete $running_pid_to_chr{$temp_pid};
+	return 0 unless defined $temp_chr;
+	my $temp_date = `date $date_format`;
+	chomp $temp_date;
+	if($temp_status != 0){
+		print $log_fh "[$temp_date]\t<ERROR> Worker for $temp_chr failed (status $temp_status)!\n";
+		$failed = 1;
+		return 1;
+	}
+	my $temp_stat_file = "${dir}/${temp_chr}_stat.dat";
+	unless(-e $temp_stat_file){
+		print $log_fh "[$temp_date]\t<ERROR> Worker for $temp_chr reported success but $temp_stat_file is missing!\n";
+		$failed = 1;
+		return 1;
+	}
+	my $temp_result_ref = retrieve($temp_stat_file);
+	@{$read{$temp_chr}} = ($temp_result_ref->[0], $temp_result_ref->[1]);
+	print $log_fh "[$temp_date]\tJoined for $temp_chr!\n";
+
+	return 1;
+}
+
+while($chr_pos < @$chr_ref || %running_pid_to_chr){
+	if($chr_pos < @$chr_ref && (scalar(keys %running_pid_to_chr) < $num_thread)){
+		my $temp_chr = $chr_ref->[$chr_pos];
+		my $temp_pid = fork();
+		unless(defined $temp_pid){
+			die "<ERROR> fork() failed: $!\n";
+		}
+		if($temp_pid == 0){
+			worker($log_fh, $temp_chr, $dir, $mapq, $prefix, $min_junc_dist, $junc, $junc_dist, $end_dist, $polya, $genome, $window, $frac_a_min, $length_a_min, $fprime, $fprime_dist, $ipr, $stp);
+			POSIX::_exit(0);
+		}
+		else{
+			$running_pid_to_chr{$temp_pid} = $temp_chr;
+			$chr_pos++;
+		}
+	}
+	else{
+		reap_one();
 	}
 }
 
-my %read = ();
-
-foreach my $thread (@thread){
-	my $result_ref = $thread->join();
-	@{$read{$result_ref->[0]}} = ($result_ref->[1], $result_ref->[2]);
-	$date = `date $date_format`;
+if($failed){
+	my $date = `date $date_format`;
 	chomp $date;
-	print $log_fh "[$date]\tJoined for $result_ref->[0]!\n";
+	print $log_fh "[$date]\t<ERROR> At least one chromosome worker failed! Aborting before generating final output.\n";
+	print STDERR "<ERROR> At least one chromosome worker failed! See ${out}.log for details. Aborting before generating final output.\n";
+	exit(1);
 }
 
 system("cat ${dir}/*_out.gtf |  sort -k 1,1 -k 4,4n >> ${out}.gtf");
@@ -307,7 +351,9 @@ chomp $date;
 print $log_fh "[$date]\tGenerated ${out}_stat.txt!\n";
 
 if($junc_dist){
-	system("echo \"chr\"\$\'\\t\'\"strand\"\$\'\\t\'\"query	nearest	distance\" > ${out}_junc_dist.txt");
+	open(my $temp_junc_dist_header_fh, "> ${out}_junc_dist.txt") or die "<ERROR> Cannot create ${out}_junc_dist.txt!\n";
+	print $temp_junc_dist_header_fh "chr\tstrand\tquery\tnearest\tdistance\n";
+	close $temp_junc_dist_header_fh;
 	system("cat ${dir}/*_junc_dist.txt >> ${out}_junc_dist.txt");
 	$date = `date $date_format`;
 	chomp $date;
@@ -315,7 +361,9 @@ if($junc_dist){
 }
 
 if($end_dist){
-	system("echo \"chr\"\$\'\\t\'\"strand\"\$\'\\t\'\"gene_id\"\$\'\\t\'\"transcript_id\"\$\'\\t\'\"depth\"\$\'\\t\'\"end_dist\" > ${out}_end_dist.txt");
+	open(my $temp_end_dist_header_fh, "> ${out}_end_dist.txt") or die "<ERROR> Cannot create ${out}_end_dist.txt!\n";
+	print $temp_end_dist_header_fh "chr\tstrand\tgene_id\ttranscript_id\tdepth\tend_dist\n";
+	close $temp_end_dist_header_fh;
 	system("cat ${dir}/*_end_dist.txt >> ${out}_end_dist.txt");
 	$date = `date $date_format`;
 	chomp $date;
@@ -425,7 +473,8 @@ sub worker{
 	#print "Correction failed: $temp_num_filtered_junc_dist\n";
 	#print "Returning %temp_read $temp_chr $temp_num_filtered_junc_dist\n";
 
-	my @temp_result = ($temp_chr, \%temp_read, $temp_num_filtered_junc_dist);
+	my @temp_result = (\%temp_read, $temp_num_filtered_junc_dist);
+	nstore(\@temp_result, "${temp_dir}/${temp_chr}_stat.dat");
 
 	my $temp_finish_time = Benchmark->new;
 	my $temp_time_spent = timediff($temp_finish_time, $temp_start_time);
@@ -433,7 +482,7 @@ sub worker{
 	chomp $temp_date;
 	print $temp_log_fh "[$temp_date]\tDone for $temp_chr in  " . timestr($temp_time_spent) . "!\n";
 
-	return \@temp_result;
+	return $temp_chr;
 }
 
 #Split the bam records of different chromosomes into different bam files.
@@ -487,8 +536,30 @@ sub split_bam{
 #Split the reference eejs of different chromosomes into different files.
 sub split_ref_eej{
 	my ($temp_chr_ref, $temp_dir, $temp_junc) = @_;
+	my %temp_valid_chr = map { ($_, 1) } @$temp_chr_ref;
+	my %temp_out_fh = ();
+	open(my $temp_fh, $temp_junc) or die "<ERROR> Cannot open $temp_junc!\n";
+	while(<$temp_fh>){
+		my $temp_line = $_;
+		my ($temp_chr) = split('\t', $temp_line, 2);
+		if(exists $temp_valid_chr{$temp_chr}){
+			unless(exists $temp_out_fh{$temp_chr}){
+				open(my $temp_ofh, "> ${temp_dir}/${temp_chr}_SJ.out.tab") or die "<ERROR> Cannot create ${temp_dir}/${temp_chr}_SJ.out.tab!\n";
+				$temp_out_fh{$temp_chr} = $temp_ofh;
+			}
+			print { $temp_out_fh{$temp_chr} } $temp_line;
+		}
+	}
+	close $temp_fh;
+	foreach my $temp_chr (keys %temp_out_fh){
+		close $temp_out_fh{$temp_chr};
+	}
+
 	foreach my $temp_chr (@$temp_chr_ref){
-		system("grep \"^$temp_chr\"\$\'\\t\' $temp_junc > ${temp_dir}/${temp_chr}_SJ.out.tab");
+		unless(exists $temp_out_fh{$temp_chr}){
+			open(my $temp_ofh, "> ${temp_dir}/${temp_chr}_SJ.out.tab") or die "<ERROR> Cannot create ${temp_dir}/${temp_chr}_SJ.out.tab!\n";
+			close $temp_ofh;
+		}
 	}
 
 	return 1;
@@ -497,9 +568,35 @@ sub split_ref_eej{
 #Split the poly-A result from nanopolish polya of different chromosomes into different files.
 sub split_polya{
 	my ($temp_chr_ref, $temp_dir, $temp_polya) = @_;
+	my %temp_valid_chr = map { ($_, 1) } @$temp_chr_ref;
+	my %temp_out_fh = ();
+	open(my $temp_fh, $temp_polya) or die "<ERROR> Cannot open $temp_polya!\n";
+	my $temp_header_line = <$temp_fh>;
 	foreach my $temp_chr (@$temp_chr_ref){
-		system("head -1 $temp_polya > ${temp_dir}/${temp_chr}_polya.txt");
-		system("grep \$\'\\t\'\"$temp_chr\"\$\'\\t\' $temp_polya >> ${temp_dir}/${temp_chr}_polya.txt");
+		open(my $temp_ofh, "> ${temp_dir}/${temp_chr}_polya.txt") or die "<ERROR> Cannot create ${temp_dir}/${temp_chr}_polya.txt!\n";
+		print $temp_ofh $temp_header_line if defined $temp_header_line;
+		$temp_out_fh{$temp_chr} = $temp_ofh;
+	}
+	while(<$temp_fh>){
+		my $temp_line = $_;
+		my $temp_chomped = $temp_line;
+		chomp $temp_chomped;
+		my @temp_fields = split('\t', $temp_chomped, -1);
+		if(@temp_fields >= 3){
+			my %temp_matched_chr = ();
+			for(my $i = 1; $i < $#temp_fields; $i++){
+				if(exists $temp_valid_chr{$temp_fields[$i]}){
+					$temp_matched_chr{$temp_fields[$i]} = 1;
+				}
+			}
+			foreach my $temp_chr (keys %temp_matched_chr){
+				print { $temp_out_fh{$temp_chr} } $temp_line;
+			}
+		}
+	}
+	close $temp_fh;
+	foreach my $temp_chr (@$temp_chr_ref){
+		close $temp_out_fh{$temp_chr};
 	}
 
 	return 1;
@@ -544,8 +641,29 @@ sub split_region{
 	unless(exists $temp_format{$temp_format}){
 		print STDERR "<ERROR> Unsupported format in split_region!\n";
 	}
+	my %temp_valid_chr = map { ($_, 1) } @$temp_chr_ref;
+	my %temp_out_fh = ();
+	open(my $temp_fh, $temp_bed) or die "<ERROR> Cannot open $temp_bed!\n";
+	while(<$temp_fh>){
+		my $temp_line = $_;
+		my ($temp_chr) = split('\t', $temp_line, 2);
+		if(exists $temp_valid_chr{$temp_chr}){
+			unless(exists $temp_out_fh{$temp_chr}){
+				open(my $temp_ofh, "> ${temp_dir}/${temp_chr}_${temp_type}.${temp_format}") or die "<ERROR> Cannot create ${temp_dir}/${temp_chr}_${temp_type}.${temp_format}!\n";
+				$temp_out_fh{$temp_chr} = $temp_ofh;
+			}
+			print { $temp_out_fh{$temp_chr} } $temp_line;
+		}
+	}
+	close $temp_fh;
+	foreach my $temp_chr (keys %temp_out_fh){
+		close $temp_out_fh{$temp_chr};
+	}
 	foreach my $temp_chr (@$temp_chr_ref){
-		system("grep \"^$temp_chr\"\$\'\\t\' $temp_bed > ${temp_dir}/${temp_chr}_${temp_type}.${temp_format}");
+		unless(exists $temp_out_fh{$temp_chr}){
+			open(my $temp_ofh, "> ${temp_dir}/${temp_chr}_${temp_type}.${temp_format}") or die "<ERROR> Cannot create ${temp_dir}/${temp_chr}_${temp_type}.${temp_format}!\n";
+			close $temp_ofh;
+		}
 	}
 
 	return 1;
@@ -622,7 +740,7 @@ sub print_stat{
 	return 1;
 }
 
-#Read the splice junction BED file if provided.
+#Read the splice junction SJ.out.tab file if provided.
 sub read_ref_eej{
 	my ($temp_junc, $temp_ref_eej_array_ref, $temp_ref_eej_hash_ref) = @_;
 	open(my $temp_fh, $temp_junc) or die "<ERROR> Cannot open $temp_junc!\n";
@@ -1214,7 +1332,7 @@ sub find_nearest{
 					foreach my $temp_right (keys %temp_right){
 						if(exists $temp_db_hash_ref->{$temp_left}{$temp_right}){
 							if(($temp_db_hash_ref->{$temp_left}{$temp_right}[4] + $temp_db_hash_ref->{$temp_left}{$temp_right}[5]) > $temp_coverage){
-								@temp_nearest_splice_site = ($temp_left, $temp_right, $temp_db_hash_ref->{$temp_left}{$temp_right});
+								@temp_nearest_splice_site = ($temp_left, $temp_right, $temp_db_hash_ref->{$temp_left}{$temp_right}[4]);
 								$temp_nearest_dist = $temp_dist;
 								$temp_coverage = ($temp_db_hash_ref->{$temp_left}{$temp_right}[4] + $temp_db_hash_ref->{$temp_left}{$temp_right}[5]);
 							}
@@ -1379,7 +1497,7 @@ sub print_gtf{
 			unless(%temp_eej){
 				next LOCI;
 			}
-			print $temp_gtf_fh "$temp_chr\tisoPropeller\tgene\t$temp_locus->[0]\t$temp_locus->[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}\"\;\n";
+			print $temp_gtf_fh "$temp_chr\tISOP\tgene\t$temp_locus->[0]\t$temp_locus->[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}\"\;\n";
 			my $temp_transcript_count = 1;
 			foreach my $temp_eej (sort keys %temp_eej){
 				#print "\tEEJ:$temp_eej\n\t@{$temp_eej{$temp_eej}}\n";
@@ -1397,7 +1515,7 @@ sub print_gtf{
 					unless($temp_polya_flag){
 						$temp_polya_flag = "NA";
 					}
-					print $temp_gtf_fh "$temp_chr\tisoPropeller\ttranscript\t$temp_transcript->[0]\t$temp_transcript->[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}\"\; transcript_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}.${temp_transcript_count}\"\; depth \"$temp_transcript->[2]\"\; polya_flag \"$temp_polya_flag\"\;\n";
+					print $temp_gtf_fh "$temp_chr\tISOP\ttranscript\t$temp_transcript->[0]\t$temp_transcript->[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}\"\; transcript_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}.${temp_transcript_count}\"\; depth \"$temp_transcript->[2]\"\; polya_flag \"$temp_polya_flag\"\;\n";
 					if($temp_end_dist){
 						print $temp_end_dist_fh "$temp_chr\t$temp_strand\t${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}\t${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}.${temp_transcript_count}\t$temp_transcript->[2]\t";
 						my @temp_ends = ();
@@ -1420,7 +1538,7 @@ sub print_gtf{
 						else{
 							$temp_cur_exon_num = $i + 1;
 						}
-						print $temp_gtf_fh "$temp_chr\tisoPropeller\texon\t$temp_exon[0]\t$temp_exon[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}\"\; transcript_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}.${temp_transcript_count}\"\; exon_number \"$temp_cur_exon_num\"\;\n";
+						print $temp_gtf_fh "$temp_chr\tISOP\texon\t$temp_exon[0]\t$temp_exon[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}\"\; transcript_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_loci_count}.${temp_transcript_count}\"\; exon_number \"$temp_cur_exon_num\"\;\n";
 					}
 					$temp_transcript_count++;
 				}
