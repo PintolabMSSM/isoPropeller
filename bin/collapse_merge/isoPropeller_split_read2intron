@@ -1,28 +1,33 @@
 #!/usr/bin/env perl
-#Author: ALin
-#Purpose: To identify introns (exon-exon junctions) according to split read sites.
-#Usage: perl isoPropeller_split_read2intron_${version}.pl [option]
-#		-i <String> Input bam file
-#		-o <String> Output
-#		-s <String> Strand of reads (Default: unstranded; RF for dUTP method; D for Nanopore direct RNA-seq or Pac-Bio Iso-seq long-read)
-#		-q <Integer> Minimal mapping quality (Inclusive; default: 0)
-#		-t <Integer> The number of threads to use (Default: 1)
-#		-btp <String> The path to bedtools
-#		-stp <String> The path to samtools
-#		-h <Boolean> Help
-#Change log:
-#	v1.1	2021-03	This script is a copy of split_reads2intron_gtf_v1.4.pl, except that the source column in the output .gtf file was changed to "isoPropeller".
-#	v1.2	2021-08 It is now able to distinguish single-end and pair-end data.
-#	v1.3	2022-07 Resctructured the codes and enabled multi-threading. Alignments that are not primary will be filtered out.
+=start
+Author: ALin
+Purpose: To identify introns (exon-exon junctions) according to split read sites.
+Usage: perl isoPropeller_split_read2intron_${version}.pl [option]
+		-i <String> Input bam file
+		-o <String> Output
+		-s <String> Strand of reads (Default: unstranded; RF for dUTP method; D for Nanopore direct RNA-seq or Pac-Bio Iso-seq long-read)
+		-q <Integer> Minimal mapping quality (Inclusive; default: 0)
+		-t <Integer> The number of threads to use (Default: 1)
+		-btp <String> The path to bedtools
+		-stp <String> The path to samtools
+		-h <Boolean> Help
+Change log:
+	v1.1	2021-03	This script is a copy of split_reads2intron_gtf_v1.4.pl, except that the source column in the output .gtf file was changed to "ISOP".
+	v1.2	2021-08 It is now able to distinguish single-end and pair-end data.
+	v1.3	2022-07 Resctructured the codes and enabled multi-threading. Alignments that are not primary will be filtered out.
+	v1.4	2026-10	Replaced `threads` with fork()+waitpid(). Fixed read_bam(). Fixed a time stamp issue. Fixed split_bam().
+=cut
 
 use strict;
 use Getopt::Long;
 use Benchmark qw(:hireswallclock);
-use threads;
+use POSIX qw(:sys_wait_h);
+
+$| = 1;
 
 my $total_start_time = Benchmark->new;
 
-my $version = "v1.3";
+my $version = "v1.4";
 my $random = `tr -dc A-Za-z0-9 </dev/urandom | head -c 10`;
 
 my ($in, $out, $lib_strand, $mapq, $num_thread, $btp, $stp, $help) = ("", "", "", 0, 1, "", "", 0);
@@ -35,7 +40,7 @@ GetOptions(
 	't=i'	=>	\$num_thread,
 	'btp=s'	=>	\$btp,
 	'stp=s'	=>	\$stp,
-        'h!'    =>      \$help,
+	'h!'	=>	\$help,
 );
 
 if($help){
@@ -91,23 +96,63 @@ my $time_spent = timediff($finish_time, $start_time);
 print "Used ".timestr($time_spent)." to preprocess $in.\n";
 
 my $chr_pos = 0;
-my @thread = ();
-my @running = ();
+my %running_pid_to_chr = ();
+my %failed = ();
 
-while(@thread < @$chr_ref){
-	@running = threads->list(threads::running);
-	if(@running < $num_thread){
-		my $thread = threads->create(\&worker, $chr_ref->[$chr_pos], $random, $lib_strand, $mapq, $stp);
-		push(@thread, $thread);
-		$chr_pos++;
+sub reap_one{
+	my ($temp_running_pid_to_chr_ref, $temp_failed_ref) = @_;
+	my $temp_pid = waitpid(-1, 0);
+	return 0 if $temp_pid <= 0;
+	my $temp_status = $?; #Capture immediately -- any subprocess started below would otherwise clobber $?.
+	my $temp_chr = delete $temp_running_pid_to_chr_ref->{$temp_pid};
+	$temp_chr = "unknown" unless defined $temp_chr;
+	if($temp_status != 0){
+		print STDERR "<ERROR> Worker for $temp_chr failed (status $temp_status)!\n";
+		$temp_failed_ref->{'true'} = 1;
+		return 1;
+	}
+	unless(-e "temp_${random}_${temp_chr}_intron.gtf"){
+		print STDERR "<ERROR> Worker for $temp_chr reported success but temp_${random}_${temp_chr}_intron.gtf is missing!\n";
+		$temp_failed_ref->{'true'} = 1;
+		return 1;
+	}
+	print "Joined for $temp_chr!\n";
+	return 1;
+}
+
+while($chr_pos < @$chr_ref || %running_pid_to_chr){
+	if($chr_pos < @$chr_ref && (scalar(keys %running_pid_to_chr) < $num_thread)){
+		my $chr = $chr_ref->[$chr_pos];
+		my $pid = fork();
+		unless(defined $pid){
+			die "<ERROR> fork() failed: $!\n";
+		}
+		if($pid == 0){
+			#Child
+			worker($chr, $random, $lib_strand, $mapq, $stp);
+			POSIX::_exit(0);
+		}
+		else{
+			#Parent
+			$running_pid_to_chr{$pid} = $chr;
+			$chr_pos++;
+		}
+	}
+	else{
+		reap_one(\%running_pid_to_chr, \%failed);
 	}
 }
 
-foreach my $thread (@thread){
-	$thread->join();
+if(exists $failed{'true'}){
+	print STDERR "<ERROR> At least one chromosome worker failed! Aborting before generating final output.\n";
+	exit(1);
 }
 
-system("cat temp_${random}_*_intron.gtf | $btp sort >> $out");
+my $cat_status = system("cat temp_${random}_*_intron.gtf | $btp sort >> $out");
+if($cat_status != 0){
+	print STDERR "<ERROR> Failed to merge and sort per-chromosome intron files into $out (status $cat_status)!\n";
+	exit(1);
+}
 system("rm temp_${random}*");
 
 my $total_finish_time = Benchmark->new;
@@ -123,7 +168,7 @@ sub worker{
 	print_intron($temp_chr, $temp_random, $temp_intron_ref);
 	my $temp_finish_time = Benchmark->new;
 	my $temp_time_spent = timediff($temp_finish_time, $temp_start_time);
-	print "Done for $temp_chr in  " . timestr($time_spent) . "!\n";
+	print "Done for $temp_chr in  " . timestr($temp_time_spent) . "!\n";
 
 	return 1;
 }
@@ -144,18 +189,35 @@ sub print_usage{
 
 sub split_bam{
 	my ($temp_bam, $temp_random, $temp_stp, $temp_num_thread) = @_;
-	system("$temp_stp sort -@ $temp_num_thread $temp_bam -o temp_${temp_random}.bam");
-	system("$temp_stp index temp_${temp_random}.bam");
+	my $temp_sort_status = system("$temp_stp sort -@ $temp_num_thread $temp_bam -o temp_${temp_random}.bam");
+	if($temp_sort_status != 0){
+		print STDERR "<ERROR> $temp_stp sort failed on $temp_bam (status $temp_sort_status)! Is it a valid bam file?\n";
+		exit(1);
+	}
+	my $temp_index_status = system("$temp_stp index temp_${temp_random}.bam");
+	if($temp_index_status != 0){
+		print STDERR "<ERROR> $temp_stp index failed on temp_${temp_random}.bam (status $temp_index_status)!\n";
+		exit(1);
+	}
 	open(TEMP, "$temp_stp view -H temp_${temp_random}.bam | grep \"^\@SQ\" | cut -d':' -f2 | cut -f1 | sort | uniq |") or die "Cannot open temp_${temp_random}.bam!\n";
 	my @temp_chr = ();
 	while(<TEMP>){
 		chomp;
 		my $temp_line = $_;
 		$temp_line =~ s/\r//;
-		system("$temp_stp view -b temp_${temp_random}.bam $temp_line > temp_${temp_random}_${temp_line}.bam");
+		my $temp_view_status = system("$temp_stp view -b temp_${temp_random}.bam $temp_line > temp_${temp_random}_${temp_line}.bam");
+		if($temp_view_status != 0){
+			print STDERR "<ERROR> $temp_stp view failed extracting $temp_line from temp_${temp_random}.bam (status $temp_view_status)!\n";
+			exit(1);
+		}
 		push(@temp_chr, $temp_line);
 	}
 	close TEMP;
+
+	unless(@temp_chr){
+		print STDERR "<ERROR> No chromosomes (\@SQ header lines) found in $temp_bam! It may be corrupted, unreadable, or not a valid bam file.\n";
+		exit(1);
+	}
 
 	return (\@temp_chr);
 }
@@ -226,7 +288,7 @@ sub read_bam{
 			#print "RF\n";
 			if($temp_line[1] & 0x1){
 				if($temp_line[1] & 0x40){
-       	         	        if($temp_line[1] & 0x10){
+      	         	        if($temp_line[1] & 0x10){
 						$temp_strand = "+";
 					}
 					else{
@@ -253,8 +315,8 @@ sub read_bam{
 		}
 		elsif($temp_lib_strand eq "D"){
 			if($temp_line[1] & 0x1){
-				print "It seems that the data is pair-end and should not long-read data. Please double check.\n";
-				exit;
+				print STDERR "<ERROR> It seems that the data is pair-end and should not be long-read data. Please double check.\n";
+				exit(1);
 			}
 			if($temp_line[1] & 0x10){
 				$temp_strand = "-";
@@ -315,11 +377,11 @@ sub print_intron{
 			foreach my $temp_pos2 (keys %{$temp_intron_ref->{$temp_pos1}}){
 				foreach my $temp_strand (keys %{$temp_intron_ref->{$temp_pos1}->{$temp_pos2}}){
 					if($temp_strand eq "."){
-						print TEMP "$temp_chr\tisoPropeller\tintron\t$temp_pos1\t$temp_pos2\t.\t+\t.\tintron_id \"${temp_chr}_${temp_pos1}-${temp_pos2}_+\"\; depth \"$temp_intron_ref->{$temp_pos1}->{$temp_pos2}->{$temp_strand}\"\;\n";
-						print TEMP "\n$temp_chr\tisoPropeller\tintron\t$temp_pos1\t$temp_pos2\t.\t-\t.\tintron_id \"${temp_chr}_${temp_pos1}-${temp_pos2}_-\"\; depth \"$temp_intron_ref->{$temp_pos1}->{$temp_pos2}->{$temp_strand}\"\;\n";
+						print TEMP "$temp_chr\tISOP\tintron\t$temp_pos1\t$temp_pos2\t.\t+\t.\tintron_id \"${temp_chr}_${temp_pos1}-${temp_pos2}_+\"\; depth \"$temp_intron_ref->{$temp_pos1}->{$temp_pos2}->{$temp_strand}\"\;\n";
+						print TEMP "\n$temp_chr\tISOP\tintron\t$temp_pos1\t$temp_pos2\t.\t-\t.\tintron_id \"${temp_chr}_${temp_pos1}-${temp_pos2}_-\"\; depth \"$temp_intron_ref->{$temp_pos1}->{$temp_pos2}->{$temp_strand}\"\;\n";
 					}
 					else{
-						print TEMP "$temp_chr\tisoPropeller\tintron\t$temp_pos1\t$temp_pos2\t.\t$temp_strand\t.\tintron_id \"${temp_chr}_${temp_pos1}-${temp_pos2}_${temp_strand}\"\; depth \"$temp_intron_ref->{$temp_pos1}->{$temp_pos2}->{$temp_strand}\"\;\n";
+						print TEMP "$temp_chr\tISOP\tintron\t$temp_pos1\t$temp_pos2\t.\t$temp_strand\t.\tintron_id \"${temp_chr}_${temp_pos1}-${temp_pos2}_${temp_strand}\"\; depth \"$temp_intron_ref->{$temp_pos1}->{$temp_pos2}->{$temp_strand}\"\;\n";
 					}
 				}
 			}
@@ -328,10 +390,3 @@ sub print_intron{
 
 	return 1;
 }
-
-
-
-
-
-
-
