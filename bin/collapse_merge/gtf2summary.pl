@@ -17,22 +17,26 @@ Change log:
 	v1.12	2023-11	Fixed an issue in parsing gtf attribute.
 	v1.13	2024-03	Allowed attribute to omit the ".
 	v1.14	2024-05	Allowed the numbers of chromosomes being different between the gtf and .fa files by only giving a warning. Prevented batch with missing sequences being lost.
+	v1.15	2026-10	Replaced the ithreads-based scheduler with a fork()-based worker pool. Fixed a bug in splitting chromosomes. Fixed an off-by-one in the dispatch loop that silently dropped the last batch, a stale-hash lookup that blanked the "Joined for batch" log line, and a regression in split_genome() that miscounted matching chromosomes between the gtf and .fa files.
+
 =cut
 
 use strict;
 use Getopt::Long;
 use Bio::Seq;
 use Bio::SeqIO;
-use threads;
 use Benchmark qw(:hireswallclock);
+use POSIX qw(:sys_wait_h);
+
+$| = 1;
 
 my $total_start_time = Benchmark->new;
 
-my $version = 'v1.14';
+my $version = 'v1.15';
 
 my ($gtf, $out, $attribute, $tag, $stop_codon_flag, $nmd, $genome, $window, $sj, $sj_intron, $sj_gtf, $num_thread, $help) = ('', '', '', '', 0, -1, '', 20, '', 0, 0, 1, 0);
 
-my $usage = "Usage: perl gtf2summary.pl
+my $usage = "Usage: perl gtf2summary_${version}.pl
 	-i <String> Input gtf file
 	-o <String> Output base
 	-a <String> The list of attribute to be retrieved
@@ -87,10 +91,11 @@ if($sj ne ''){
 }
 
 open(my $log_fh, "> ${out}.log") or die "Cannot create ${out}.log!\n";
+$log_fh->autoflush(1); #Each forked worker inherits this fd with its own userspace write buffer; flush every print immediately so concurrent children's log lines don't get chopped up into interleaved partial chunks.
 my $date_format = "+%F-%T.%3N";
 my $date = `date $date_format`;
 chomp $date;
-print $log_fh "[$date]\tperl gtf2transcript_summary_${version}.pl -i $gtf -o $out";
+print $log_fh "[$date]\tperl gtf2summary_${version}.pl -i $gtf -o $out";
 
 if($attribute){
 	unless(-e $attribute){
@@ -156,36 +161,68 @@ my $start_time = Benchmark->new;
 $date = `date $date_format`;
 chomp $date;
 print $log_fh "[$date]\tStarting preprocessing...\n";
-my $batch_ref = split_gtf($gtf, $num_thread, $dir);
+my ($chr_to_batch_ref, $num_batch) = split_gtf($gtf, $num_thread, $dir);
 if($genome){
-	split_genome($batch_ref, $gtf, $genome, $dir);
+	split_genome($chr_to_batch_ref, $gtf, $genome, $dir);
 }
 if($sj){
-	split_sj($batch_ref, $sj, $dir);
+	split_sj($chr_to_batch_ref, $sj, $dir);
 }
 my $finish_time = Benchmark->new;
 my $time_spent = timediff($finish_time, $start_time);
 $date = `date $date_format`;
 chomp $date;
 print $log_fh "[$date]\tUsed ". timestr($time_spent) . " for preprocessing\n";
-my $batch = 1;
-my @thread = ();
-my @running = ();
 
-while(@thread < keys %$batch_ref){
-	@running = threads->list(threads::running);
-	if(@running < $num_thread){
-		my $thread = threads->create(\&worker, $batch, $dir, $date_format, $attribute, $tag, $stop_codon_flag, $nmd, $genome, $window, $sj_intron, $sj_gtf);
-		push(@thread, $thread);
-		$batch++;
+my $batch = 1;
+my %running_pid_to_batch = ();
+my %failed = ();
+
+sub reap_one{
+	my ($temp_date_format, $temp_log_fh, $temp_running_pid_to_batch_ref, $temp_failed_ref) = @_;
+	my $temp_pid = waitpid(-1, 0);
+	return 0 if $temp_pid <= 0;
+	my $temp_status = $?; #Capture immediately -- the `date` backtick below is itself a subprocess and would otherwise clobber $?.
+	my $temp_batch = delete $temp_running_pid_to_batch_ref->{$temp_pid};
+	return 0 unless defined $temp_batch;
+	my $temp_date = `date $temp_date_format`;
+	chomp $temp_date;
+	if($temp_status != 0){
+		print $temp_log_fh "[$temp_date]\t<ERROR> Worker for $temp_batch failed (status $temp_status)!\n";
+		$temp_failed_ref->{'true'} = 1;
+		return 1;
+	}
+	print $temp_log_fh "[$temp_date]\tJoined for batch $temp_batch!\n";
+
+	return 1;
+}
+
+while($batch <= $num_batch || %running_pid_to_batch){
+	if($batch <= $num_batch && (scalar(keys %running_pid_to_batch) < $num_thread)){
+		my $pid = fork();
+		unless(defined $pid){
+			die "<ERROR> fork() failed: $!\n";
+		}
+		if($pid == 0){
+			worker($log_fh, $batch, $dir, $date_format, $attribute, $tag, $stop_codon_flag, $nmd, $genome, $window, $sj_intron, $sj_gtf);
+			POSIX::_exit(0);
+		}
+		else{
+			$running_pid_to_batch{$pid} = $batch;
+			$batch++;
+		}
+	}
+	else{
+		reap_one($date_format, $log_fh, \%running_pid_to_batch, \%failed);
 	}
 }
 
-foreach my $thread (@thread){
-	my @result = $thread->join();
+if(exists $failed{'true'}){
 	$date = `date $date_format`;
 	chomp $date;
-	print $log_fh "[$date]\tJoined for batch $result[0]!\n";
+	print $log_fh "[$date]\t<ERROR> At least one batch worker failed! Aborting before generating final output.\n";
+	print STDERR "<ERROR> At least one batch worker failed! See ${out}.log for details. Aborting before generating final output.\n";
+	exit(1);
 }
 
 open(my $out_transcript_fh, "> ${out}_transcript.txt") or die "<ERROR> Cannot create ${out}_transcript.txt!\n";
@@ -226,10 +263,10 @@ print $log_fh "[$date]\tTotal time used: ". timestr($total_time_spent) . "\n";
 close $log_fh;
 
 sub worker{
-	my ($temp_batch, $temp_dir, $temp_date_format, $temp_attribute, $temp_tag, $temp_stop_codon_flag, $temp_nmd, $temp_genome, $temp_window, $temp_sj_intron, $temp_sj_gtf) = @_;
+	my ($temp_log_fh, $temp_batch, $temp_dir, $temp_date_format, $temp_attribute, $temp_tag, $temp_stop_codon_flag, $temp_nmd, $temp_genome, $temp_window, $temp_sj_intron, $temp_sj_gtf) = @_;
 	my $temp_date = `date $temp_date_format`;
 	chomp $temp_date;
-	print $log_fh "[$temp_date]\tStarting to process batch $temp_batch...\n";
+	print $temp_log_fh "[$temp_date]\tStarting to process batch $temp_batch...\n";
 	my $temp_start_time = Benchmark->new;
 	my $temp_attribute_ref = read_list($temp_attribute);
 	my $temp_tag_ref = read_list($temp_tag);
@@ -239,7 +276,7 @@ sub worker{
 	my $temp_time_spent = timediff($temp_finish_time, $temp_start_time);
 	$temp_date = `date $temp_date_format`;
 	chomp $temp_date;
-	print $log_fh "[$temp_date]\tDone for batch $temp_batch in " . timestr($temp_time_spent) , "!\n";
+	print $temp_log_fh "[$temp_date]\tDone for batch $temp_batch in " . timestr($temp_time_spent) , "!\n";
 
 	return $temp_batch;
 
@@ -283,53 +320,55 @@ sub split_gtf{
 	close $temp_fh;
 	my $temp_batch_size = int($temp_transcript_count / $temp_num_thread) + 1;
 	my ($temp_count, $temp_batch) = (0, 1);
-	my %temp_batch = ();
+	my %temp_chr_to_batch = ();
 	open($temp_fh, "> ${temp_dir}/batch_${temp_batch}.gtf") or die "<ERROR> Cannot create ${temp_dir}/batch_${temp_batch}.gtf!\n";
 	foreach my $temp_gene_id (@temp_gene){
 		$temp_count += keys %{$temp_transcript_count{$temp_gene_id}};
 		if($temp_count > ($temp_batch_size * $temp_batch)){
 			close $temp_fh;
 			$temp_batch++;
-			unless(exists $temp_batch{$temp_batch}){
-				%{$temp_batch{$temp_batch}} = ();
-			}
 			open($temp_fh, "> ${temp_dir}/batch_${temp_batch}.gtf");
 		}
 		foreach my $temp_line (@{$temp_gene{$temp_gene_id}}){
 			print $temp_fh "$temp_line\n";
-			my @temp_line = split('\t', $temp_line);
-			unless(exists $temp_batch{$temp_batch}{$temp_line[0]}){
-				$temp_batch{$temp_batch}{$temp_line[0]} = 1;
+			my ($temp_chr) = split('\t', $temp_line, 2);
+			unless(exists $temp_chr_to_batch{$temp_chr}){
+				%{$temp_chr_to_batch{$temp_chr}} = ();
+			}
+			unless(exists $temp_chr_to_batch{$temp_chr}{$temp_batch}){
+				$temp_chr_to_batch{$temp_chr}{$temp_batch} = 1;
 			}
 		}
 	}
 	close $temp_fh;
 
-	return (\%temp_batch);
+	return (\%temp_chr_to_batch, $temp_batch);
 }
 
 sub split_genome{
-	my ($temp_batch_ref, $temp_gtf, $temp_genome, $temp_dir) = @_;
+	my ($temp_chr_to_batch_ref, $temp_gtf, $temp_genome, $temp_dir) = @_;
 	my $temp_seq_in = Bio::SeqIO->new(-file => $temp_genome, -format => 'fasta');
 	my %temp_seq_out = ();
 	my %temp_chr_gtf = ();
 	my %temp_chr_count = ();
-	foreach my $temp_batch (keys %$temp_batch_ref){
-		$temp_seq_out{$temp_batch} = Bio::SeqIO->new(-file => "> ${temp_dir}/batch_${temp_batch}.fa", -format => 'fasta');
-		foreach my $temp_chr (keys %{$temp_batch_ref->{$temp_batch}}){
-			unless(exists $temp_chr_gtf{$temp_chr}){
-				$temp_chr_gtf{$temp_chr} = 1;
+	foreach my $temp_chr (keys %$temp_chr_to_batch_ref){
+		unless(exists $temp_chr_gtf{$temp_chr}){
+			$temp_chr_gtf{$temp_chr} = 1;
+		}
+		foreach my $temp_batch (keys %{$temp_chr_to_batch_ref->{$temp_chr}}){
+			unless(exists $temp_seq_out{$temp_batch}){
+				$temp_seq_out{$temp_batch} = Bio::SeqIO->new(-file => "> ${temp_dir}/batch_${temp_batch}.fa", -format => 'fasta');
 			}
 		}
 	}
 	while(my $temp_seq_obj = $temp_seq_in->next_seq){
 		my $temp_chr = $temp_seq_obj->primary_id;
-		foreach my $temp_batch (keys %$temp_batch_ref){
-			if(exists $temp_batch_ref->{$temp_batch}{$temp_chr}){
+		if(exists $temp_chr_to_batch_ref->{$temp_chr}){
+			unless(exists $temp_chr_count{$temp_chr}){
+				$temp_chr_count{$temp_chr} = 1;
+			}
+			foreach my $temp_batch (keys %{$temp_chr_to_batch_ref->{$temp_chr}}){
 				$temp_seq_out{$temp_batch}->write_seq($temp_seq_obj);
-				unless(exists $temp_chr_count{$temp_chr}){
-					$temp_chr_count{$temp_chr} = 1;
-				}
 			}
 		}
 	}
@@ -343,14 +382,25 @@ sub split_genome{
 }
 
 sub split_sj{
-	my ($temp_batch_ref, $temp_sj, $temp_dir) = @_;
+	my ($temp_chr_to_batch_ref, $temp_sj, $temp_dir) = @_;
 	open(my $temp_in_fh, $temp_sj) or die "Cannot open $temp_sj!\n";
 	my %temp_out_fh = ();
-	foreach my $temp_batch (keys %$temp_batch_ref){
-		open($temp_out_fh{$temp_batch}, "> ${temp_dir}/batch_${temp_batch}.sj") or die "Cannot create ${temp_dir}/batch_${temp_batch}.sj!\n";
-		foreach my $temp_chr (keys %{$temp_batch_ref->{$temp_batch}}){
-			system("grep \"^${temp_chr}\"\$\'\\t\' $temp_sj >> ${temp_dir}\/batch_${temp_batch}.sj");
+	foreach my $temp_chr (keys %$temp_chr_to_batch_ref){
+		foreach my $temp_batch (keys %{$temp_chr_to_batch_ref->{$temp_chr}}){
+			unless(exists $temp_out_fh{$temp_batch}){
+				open($temp_out_fh{$temp_batch}, "> ${temp_dir}/batch_${temp_batch}.sj") or die "Cannot create ${temp_dir}/batch_${temp_batch}.sj!\n";
+			}
 		}
+	}
+	while(<$temp_in_fh>){
+		my $temp_line = $_;
+		my ($temp_chr) = split('\t', $temp_line, 2);
+		foreach my $temp_batch (keys %{$temp_chr_to_batch_ref->{$temp_chr}}){
+			print {$temp_out_fh{$temp_batch}} $temp_line;
+		}
+	}
+	close $temp_in_fh;
+	foreach my $temp_batch (keys %temp_out_fh){
 		close $temp_out_fh{$temp_batch};
 	}
 
