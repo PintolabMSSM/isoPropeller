@@ -11,24 +11,29 @@ Change log:
 	v1.6	2023-09	Restructured the code.
 	v1.6.2	2026-07	Modified merge_loci and merge_transcript to improve run time.
 	v1.6.3	2026-07	Modified locus_sub_cluster and removed compare_transcript to improve run time.
+	v1.6.5	2026-10	Memory optimization for large sample lists.
+	v1.6.6	2026-10	Fixed the chromosome split issue.
 =cut
 
 use strict;
+use warnings;
 use Getopt::Long;
 use List::Util qw(max min);
-use threads;
+use POSIX ":sys_wait_h";
 use Benchmark qw(:hireswallclock);
+
+$| = 1;
 
 my $total_start_time = Benchmark->new;
 
-my $version = "v1.6.3";
+my $version = "v1.6.6";
 
-my $usage = "Usage: perl isoPropeller_merge
+my $usage = "Usage: perl isoPropeller_merge_${version}.pl
 	-i <String> Input list of .gtf file(s)
 	-o <String> Output base
 	-e <String> The atribute for the getting expression value (cov, FPKM, TPM and etc.)
-	-p <String> The prefix of gene and transcript IDs (Default: NIAP)
-	-t <Integer> Number of threads (Default: 1)
+	-p <String> The prefix of gene and transcript IDs (Default: ISOP)
+	-t <Integer> Number of worker processes to run at once (Default: 1)
 	-h <Boolean> Help
 ";
 
@@ -40,7 +45,7 @@ GetOptions(
 	'e=s'	=>	\$exp,
 	'p=s'	=>	\$prefix,
 	't=i'	=>	\$num_thread,
-        'h!'    =>      \$help,
+	'h!'	=>	\$help,
 );
 
 if($help){
@@ -98,28 +103,63 @@ $date = `date $date_format`;
 chomp $date;
 print "[isoPropeller_merge $date]\tUsed ". timestr($time_spent) . " for preprocessing\n";
 
+my %running_pid_to_chr = ();
 my $chr_pos = 0;
-my @thread = ();
-my @running = ();
+my %failed = ();
 
-while(@thread < @$chr_ref){
-	@running = threads->list(threads::running);
-	if(@running < $num_thread){
-		my $thread = threads->create(\&worker, $chr_ref->[$chr_pos], $dir, $date_format, $in, $exp, $prefix);
-		push(@thread, $thread);
-		$chr_pos++;
+sub reap_one{
+	my ($temp_date_format, $temp_running_pid_to_ref, $temp_failed_ref) = @_;
+	my $temp_pid = waitpid(-1, 0);
+	return 0 if $temp_pid <= 0;
+	my $temp_status = $?;
+	my $temp_chr = delete $temp_running_pid_to_ref->{$temp_pid};
+	return 0 unless defined $temp_chr;
+	my $temp_date = `date $temp_date_format`;
+	chomp $temp_date;
+	if($temp_status != 0){
+		print STDERR "[isoPropeller_merge $temp_date]\t<ERROR> Worker for $temp_chr failed (exit status $temp_status)!\n";
+		$temp_failed_ref->{'true'} = 1;
 	}
+	else{
+		print "[isoPropeller_merge $temp_date]\tJoined for $temp_chr!\n";
+	}
+	return 1;
 }
 
-foreach my $thread (@thread){
-	my @result = $thread->join();
-	$date = `date $date_format`;
-	chomp $date;
-	print "[isoPropeller_merge $date]\tJoined for $result[0]!\n";
+while($chr_pos < @$chr_ref){
+	while(scalar(keys %running_pid_to_chr) >= $num_thread){
+		reap_one($date_format, \%running_pid_to_chr, \%failed);
+	}
+	my $chr = $chr_ref->[$chr_pos];
+	$chr_pos++;
+	my $pid = fork();
+	unless(defined $pid){
+		print STDERR "<ERROR> fork() failed: $!\n";
+		$failed{'true'} = 1;
+		last;
+	}
+	if($pid == 0){
+		# child
+		worker($chr, $dir, $date_format, $in, $exp, $prefix);
+		POSIX::_exit(0);
+	}
+	else{
+		$running_pid_to_chr{$pid} = $chr;
+	}
+}
+while(scalar(keys %running_pid_to_chr) > 0){
+	reap_one($date_format, \%running_pid_to_chr, \%failed);
+}
+
+if(exists $failed{'true'}){
+	print STDERR "<ERROR> One or more chromosomes failed; aborting before writing final output.\n";
+	exit(1);
 }
 
 system("cat ${dir}/*.gtf | sort -k 1,1 -k 4,4n >> ${out}.gtf");
-system("echo \"chr\"\$\'\\t\'\"strand\"\$\'\\t\'\"gene_id\"\$\'\\t\'\"transcript_id\"\$\'\\t\'\"original_id\"\$\'\\t\'\"depth\"\$\'\\t\'\"end_dist\" > ${out}_id.txt");
+open(my $id_header_fh, "> ${out}_id.txt") or die "<ERROR> Cannot create ${out}_id.txt!\n";
+print $id_header_fh "chr\tstrand\tgene_id\ttranscript_id\toriginal_id\tdepth\tend_dist\n";
+close $id_header_fh;
 system("cat ${dir}/*_id.txt >> ${out}_id.txt");
 if($exp){
 	open(my $in_fh, $in) or die "<ERROR> Cannot open $in!\n";
@@ -303,7 +343,7 @@ sub parse_transcript{
 	foreach my $temp_transcript_id (keys %{$temp_transcript_ref}){
 		#Extract the information of the current transcript for simplicity
 		my $temp_strand = $temp_transcript_ref->{$temp_transcript_id}{'strand'};
-		my $temp_exp = $temp_transcript_ref->{$temp_transcript_id}{'exp'};
+		my $temp_exp = $temp_transcript_ref->{$temp_transcript_id}{'exp'}; # undef unless -e was given
 		my @temp_exon = @{$temp_transcript_ref->{$temp_transcript_id}{'exon'}};
 		#Parse the exon structure
 		my @temp_sorted_exon = sort {$a->[0] <=> $b->[0]} @temp_exon;
@@ -323,15 +363,18 @@ sub parse_transcript{
 	return 1;
 }
 
-#Add a transcript
 sub add_transcript{
 	my ($temp_loci_ref, $temp_num_sample, $temp_cur_sample, $temp_strand, $temp_exp, $temp_leftmost, $temp_rightmost, $temp_eej, $temp_transcript_id) = @_;
 	#Initiate the strand
 	unless(exists $temp_loci_ref->{$temp_strand}){
 		@{$temp_loci_ref->{$temp_strand}} = ();
 	}
-	my @temp_exp = (0) x $temp_num_sample;
-	$temp_exp[$temp_cur_sample] = $temp_exp;
+	my $temp_exp_packed = undef;
+	if(defined $temp_exp){
+		my @temp_exp_vec = (0) x $temp_num_sample;
+		$temp_exp_vec[$temp_cur_sample] = $temp_exp;
+		$temp_exp_packed = pack("d*", @temp_exp_vec);
+	}
 	my %temp_transcript = ();
 	unless(exists $temp_transcript{$temp_eej}){
 		@{$temp_transcript{$temp_eej}} = ();
@@ -342,7 +385,7 @@ sub add_transcript{
 	}
 	my $temp_ends = "$temp_leftmost-$temp_rightmost";
 	my %temp_ends = ($temp_ends, 1);
-	my @temp_transcript = ($temp_leftmost, $temp_rightmost, \@temp_exp, \%temp_transcript_id, \%temp_ends);
+	my @temp_transcript = ($temp_leftmost, $temp_rightmost, $temp_exp_packed, \%temp_transcript_id, \%temp_ends);
 	push(@{$temp_transcript{$temp_eej}}, \@temp_transcript);
 	my @temp_loci = ($temp_leftmost, $temp_rightmost, \%temp_transcript);
 	push(@{$temp_loci_ref->{$temp_strand}}, \@temp_loci);
@@ -351,7 +394,6 @@ sub add_transcript{
 #		print "\tEEJ:$i\n";
 #		foreach my $j (@{$temp_loci[2]{$i}}){
 #			print "\tTranscript:@{$j}\n";
-#			print "EXP:@{$j->[2]}\n";
 #			my @temp_id = keys %{$j->[3]};
 #			print "ID: @temp_id\n";
 #		}
@@ -406,9 +448,14 @@ sub merge_transcript{
 			if($temp_cur->[1] > $temp_last->[1]){
 				$temp_last->[1] = $temp_cur->[1];
 			}
-			#Sum expression per sample
-			for(my $j = 0; $j < $temp_num_sample; $j++){
-				$temp_last->[2][$j] += $temp_cur->[2][$j];
+			#Sum expression per sample (skipped entirely when -e wasn't given, i.e. both sides' packed vector is undef)
+			if(defined $temp_last->[2] || defined $temp_cur->[2]){
+				my @temp_a = defined $temp_last->[2] ? unpack("d*", $temp_last->[2]) : (0) x $temp_num_sample;
+				my @temp_b = defined $temp_cur->[2] ? unpack("d*", $temp_cur->[2]) : (0) x $temp_num_sample;
+				for(my $j = 0; $j < $temp_num_sample; $j++){
+					$temp_a[$j] += $temp_b[$j];
+				}
+				$temp_last->[2] = pack("d*", @temp_a);
 			}
 			#Union of original transcript IDs
 			foreach my $temp_tid (keys %{$temp_cur->[3]}){
@@ -578,7 +625,7 @@ sub print_gtf_exp{
 			my ($temp_sub_loci_ref, $temp_sub_loci_region_ref) = locus_sub_cluster($temp_locus);
 			#print "$temp_chr\t$temp_strand\t$temp_loci\n";
 			foreach my $temp_sub_locus (keys %$temp_sub_loci_region_ref){
-				print $temp_gtf_fh "$temp_chr\tNIAP\tgene\t$temp_sub_loci_region_ref->{$temp_sub_locus}->[0]\t$temp_sub_loci_region_ref->{$temp_sub_locus}->[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}_${temp_sub_locus}\"\;\n";
+				print $temp_gtf_fh "$temp_chr\tISOP\tgene\t$temp_sub_loci_region_ref->{$temp_sub_locus}->[0]\t$temp_sub_loci_region_ref->{$temp_sub_locus}->[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}_${temp_sub_locus}\"\;\n";
 			}
 			my $temp_transcript_count = 1;
 			foreach my $temp_eej (sort keys %{$temp_locus->[2]}){
@@ -586,7 +633,7 @@ sub print_gtf_exp{
 					my $temp_eej_new = $temp_transcript->[0]. $temp_eej . $temp_transcript->[1];
 					my @temp_eej = split(',', $temp_eej_new);
 					my $temp_num_exon = @temp_eej;
-					print $temp_gtf_fh "$temp_chr\tNIAP\ttranscript\t$temp_transcript->[0]\t$temp_transcript->[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}_$temp_sub_loci_ref->{$temp_eej_new}\"\; transcript_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}.${temp_transcript_count}\"\;\n";
+					print $temp_gtf_fh "$temp_chr\tISOP\ttranscript\t$temp_transcript->[0]\t$temp_transcript->[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}_$temp_sub_loci_ref->{$temp_eej_new}\"\; transcript_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}.${temp_transcript_count}\"\;\n";
 					for(my $i = 0; $i < $temp_num_exon; $i++){
 						my $temp_cur_exon_num;
 						my @temp_exon = split('-', $temp_eej[$i]);
@@ -598,12 +645,12 @@ sub print_gtf_exp{
 						else{
 							$temp_cur_exon_num = $i + 1;
 						}
-						print $temp_gtf_fh "$temp_chr\tNIAP\texon\t$temp_exon[0]\t$temp_exon[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}_$temp_sub_loci_ref->{$temp_eej_new}\"\; transcript_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}.${temp_transcript_count}\"\; exon_number \"$temp_cur_exon_num\"\;\n";
+						print $temp_gtf_fh "$temp_chr\tISOP\texon\t$temp_exon[0]\t$temp_exon[1]\t.\t$temp_strand\t.\tgene_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}_$temp_sub_loci_ref->{$temp_eej_new}\"\; transcript_id \"${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}.${temp_transcript_count}\"\; exon_number \"$temp_cur_exon_num\"\;\n";
 					}
 					if($temp_exp){
 						print $temp_exp_fh "${temp_prefix}_${temp_chr}_$temp_strand_flag{$temp_strand}_${temp_locus_count}.${temp_transcript_count}";
-						foreach my $temp_exp (@{$temp_transcript->[2]}){
-							print $temp_exp_fh "\t$temp_exp";
+						foreach my $temp_exp_val (unpack("d*", $temp_transcript->[2])){
+							print $temp_exp_fh "\t$temp_exp_val";
 						}
 						print $temp_exp_fh "\n";
 					}
@@ -627,11 +674,6 @@ sub print_gtf_exp{
 		close $temp_exp_fh;
 	}
 	close $temp_id_fh;
-	
+
 	return 1;
 }
-
-
-
-
-
