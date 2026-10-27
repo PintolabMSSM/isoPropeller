@@ -24,33 +24,37 @@ Change logs:
 	(9) Compare all remaining query monoexonic isoforms to reference monoexonic isoforms, excluding monoexonic non-coding gene. known: Require overlapping between the two monoexonic isoforms.
 	(10) Group all remaining query isoforms, including monoexonic and multiexonic, overlapping with each other into loci. 
 	(11) Classify novel genes based on https://pubmed.ncbi.nlm.nih.gov/32747822/, with reference to protein-coding genes. ncRNA_host_gene > divergent (100 bp by default) > intronic > overlapping > antisense > intergenic (sub-type overlapping)
-	v1.10	2023-10	Restructured the code. Added ref_gene_name and used gene_name corresponding to the gene_id. Modified to use isoPropeller_merge v1.6.
+	v1.10	2023-10	Restructured the code. Added ref_gene_name and used gene_name corresponding to the gene_id. Modified to use isoPropeller_merge_1.6.pl.
 	v1.11	2023-11	Added an option to use TSS region instead of TSS position. Modified the functions to output TSS without adding the promoter width. Revised the step for re-arranging fusion gene ID. Switched the order of the 4th and 5th passes. Added query_match and query_overlap during evaluation, and updated the ranking, query_match > query_overlap > ref_match > ref_overlap > overlap. Fixed an issue to keep gene_name updated as gene_id for novel genes. Fixed an issue of getting gtf attributes.
 	v1.12	2024-05	Fixed a bug in tss_dist. Fixed a bug in the 1st-pass when the best reference transcript is from a novel gene but there is no match of exon. Fixed the issue when the reference is empty. Minor modifications. Fixed a bug when a partial isoform is from a novel gene.
 	v1.13	2024-09	Fixed the bed file left position issue.
+	v1.14	2026-10	Fixed split_gtf()/split_bed() with single native-Perl passes. Fixed read_bed() position issue. Fixed -b type.
+	v1.15	2026-10	Replaced the `threads`-based worker pool and its busy-wait scheduling loop with a fork()+waitpid worker pool.
 =cut
 
 use strict;
 use Getopt::Long;
 use List::Util qw(min max sum);
-use threads;
+use POSIX ":sys_wait_h";
 use Benchmark qw(:hireswallclock);
 
-my $isopropeller_merge = `dirname $0`;
-chomp $isopropeller_merge;
-$isopropeller_merge .= "/isoPropeller_merge";
-unless(-e $isopropeller_merge){
-	print STDERR "$isopropeller_merge not found. Please install the script.\n";
+$| = 1;
+
+my $isop_merge = `dirname $0`;
+chomp $isop_merge;
+$isop_merge .= "/isoPropeller_merge";
+unless(-e $isop_merge){
+	print STDERR "$isop_merge not found. Please install the script.\n";
 	exit;
 }
 
 my $total_start_time = Benchmark->new;
 
-my $version = "v1.13";
+my $version = "v1.15";
 
 my ($ref, $query, $out, $max_p, $max_bd, $missing, $tss_region, $btp, $num_thread, $help) = ("", "", "", 100, 100, 0, "", "", 1, 0);
 
-my $usage = "Usage: perl isoPropeller_annotate
+my $usage = "Usage: perl isoPropeller_annotate_${version}.pl
 	-q <String> Input query gtf file
 	-r <String> Input reference gtf file
 	-o <String> Output file
@@ -73,7 +77,7 @@ GetOptions(
 	'd=i'	=>	\$max_bd,
 	'm!'	=>	\$missing,
 	'e=s'	=> 	\$tss_region,
-	'b!'	=>	\$btp,
+	'b=s'	=>	\$btp,
 	't=i'	=>	\$num_thread,
 	'h!'	=>	\$help,
 );
@@ -122,7 +126,7 @@ my $date_format = "+%F-%T.%3N";
 my $date = `date $date_format`;
 chomp $date;
 print "[isoPropeller_annotate $date]\tperl isoPropeller_annotate_${version}.pl -q $query -r $ref -o $out -b $btp -t $num_thread -d $max_bd -p $max_p";
-print $out_fh "#perl isoPropeller_annotate_${version} -q $query -r $ref -o $out -b $btp -t $num_thread -d $max_bd -p $max_p";
+print $out_fh "#perl isoPropeller_annotate_${version}.pl -q $query -r $ref -o $out -b $btp -t $num_thread -d $max_bd -p $max_p";
 if($missing){
 	print " -m";
 	print $out_fh " -m";
@@ -169,11 +173,9 @@ my $start_time = Benchmark->new;
 $date = `date $date_format`;
 chomp $date;
 print "[isoPropeller_annotate $date]\tStarting preprocessing...\n";
-system("grep \$\'\\t\'\"exon\"\$\'\\t\' $ref > ${dir}/ref.gtf");
-system("grep \$\'\\t\'\"exon\"\$\'\\t\' $query > ${dir}/query.gtf");
-my $chr_ref = split_gtf("${dir}/ref.gtf", "${dir}/query.gtf", $dir);
+my $chr_ref = split_gtf($ref, $query, $dir);
 if($tss_region){
-	split_bed($tss_region, $dir);
+	split_bed($tss_region, $dir, $chr_ref);
 }
 my $finish_time = Benchmark->new;
 my $time_spent = timediff($finish_time, $start_time);
@@ -181,24 +183,56 @@ $date = `date $date_format`;
 chomp $date;
 print "[isoPropeller_annotate $date]\tUsed ". timestr($time_spent) . " for preprocessing\n";
 
+my %running_pid_to_chr = ();
 my $chr_pos = 0;
-my @thread = ();
-my @running = ();
+my %failed = ();
 
-while(@thread < @$chr_ref){
-	@running = threads->list(threads::running);
-	if(@running < $num_thread){
-		my $thread = threads->create(\&worker, $chr_ref->[$chr_pos], $isopropeller_merge, $dir, $date_format, $max_p, $max_bd, $missing, $tss_region, $btp);
-		push(@thread, $thread);
-		$chr_pos++;
+sub reap_one{
+	my ($temp_date_format, $temp_running_pid_to_chr_ref, $temp_failed_ref) = @_;
+	my $temp_pid = waitpid(-1, 0);
+	return 0 if $temp_pid <= 0;
+	my $temp_status = $?;
+	my $temp_chr = delete $temp_running_pid_to_chr_ref->{$temp_pid};
+	return 0 unless defined $temp_chr;
+	my $temp_date = `date $temp_date_format`;
+	chomp $temp_date;
+	if($temp_status != 0){
+		print STDERR "[isoPropeller_annotate $temp_date]\t<ERROR> Worker for $temp_chr failed (exit status $temp_status)!\n";
+		$temp_failed_ref->{'true'} = 1;
 	}
+	else{
+		print "[isoPropeller_annotate $temp_date]\tJoined for $temp_chr!\n";
+	}
+	return 1;
 }
 
-foreach my $thread (@thread){
-	my @result = $thread->join();
-	$date = `date $date_format`;
-	chomp $date;
-	print "[isoPropeller_annotate $date]\tJoined for $result[0]!\n";
+while($chr_pos < @$chr_ref){
+	while(scalar(keys %running_pid_to_chr) >= $num_thread){
+		reap_one($date_format, \%running_pid_to_chr, \%failed);
+	}
+	my $chr = $chr_ref->[$chr_pos];
+	$chr_pos++;
+	my $pid = fork();
+	unless(defined $pid){
+		print STDERR "<ERROR> fork() failed: $!\n";
+		$failed{'true'} = 1;
+		last;
+	}
+	if($pid == 0){
+		worker($chr, $isop_merge, $dir, $date_format, $max_p, $max_bd, $missing, $tss_region, $btp);
+		POSIX::_exit(0);
+	}
+	else{
+		$running_pid_to_chr{$pid} = $chr;
+	}
+}
+while(scalar(keys %running_pid_to_chr) > 0){
+	reap_one($date_format, \%running_pid_to_chr, \%failed);
+}
+
+if(exists $failed{'true'}){
+	print STDERR "<ERROR> One or more chromosomes failed; aborting before writing final output.\n";
+	exit(1);
 }
 
 system("cat ${dir}/*_out.gtf | $btp sort >> $out");
@@ -217,7 +251,7 @@ chomp $date;
 print "[isoPropeller_annotate $date]\tTotal time used: ". timestr($total_time_spent) . "\n";
 
 sub worker{
-	my ($temp_chr, $temp_isopropeller_merge, $temp_dir, $temp_date_format, $temp_max_p, $temp_max_bd, $temp_missing, $temp_tss_region, $temp_btp) = @_;
+	my ($temp_chr, $temp_isop_merge, $temp_dir, $temp_date_format, $temp_max_p, $temp_max_bd, $temp_missing, $temp_tss_region, $temp_btp) = @_;
 	my %temp_monoexonic_gene_type = ("miRNA", 1, "misc_RNA", 1, "Mt_rRNA", 1, "Mt_tRNA", 1, "ribozyme", 1, "rRNA", 1, "rRNA_pseudogene", 1, "scaRNA", 1, "scRNA", 1, "snoRNA", 1, "snRNA", 1, "sRNA", 1, "vaultRNA", 1);
 	my %temp_pc_gene_type = ("protein_coding", 1);
 	my %temp_immune_gene_type = ("IG_C_gene", 1, "IG_C_pseudogene", 1, "IG_D_gene", 1, "IG_J_gene", 1, "IG_J_pseudogene", 1, "IG_pseudogene", 1, "IG_V_gene", 1, "IG_V_pseudogene", 1, "TR_C_gene", 1, "TR_D_gene", 1, "TR_J_gene", 1, "TR_J_pseudogene", 1, "TR_V_gene", 1, "TR_V_pseudogene", 1);
@@ -252,7 +286,10 @@ sub worker{
 	);
 	system("cat ${temp_dir}/ref_${temp_chr}.gtf ${temp_dir}/query_${temp_chr}_novel_ref_reclustered.gtf > ${temp_dir}/ref_${temp_chr}_expanded.gtf");
 	system("echo ${temp_dir}/ref_${temp_chr}_expanded.gtf > ${temp_dir}/ref_${temp_chr}_gtf_list.txt");
-	system("perl $temp_isopropeller_merge -i ${temp_dir}/ref_${temp_chr}_gtf_list.txt -o ${temp_dir}/ref_${temp_chr}_expanded_merged -b $temp_btp");
+	#isoPropeller_merge has no -b option (it never calls bedtools itself); passing one
+	#through here used to just make it print "Unknown option: b" and drop the
+	#value, once per chromosome.
+	system("perl $temp_isop_merge -i ${temp_dir}/ref_${temp_chr}_gtf_list.txt -o ${temp_dir}/ref_${temp_chr}_expanded_merged");
 	my $temp_loci_ref = read_loci_id("${temp_dir}/ref_${temp_chr}_expanded_merged_id.txt");
 
 	#1st-pass annotation: Identify annotated, fusion and novel transcripts of known genes and those of novel genes
@@ -533,28 +570,89 @@ sub worker{
 	return $temp_chr;
 }
 
-#Split annotation
 sub split_gtf{
 	my ($temp_ref, $temp_query, $temp_dir) = @_;
-	system("grep -v \"^#\" $temp_query | cut -f1  | sort | uniq > ${temp_dir}/chr_list.txt");
-	my @temp_chr = ();
-	open(my $temp_fh, "${temp_dir}/chr_list.txt") or die "Cannot open ${temp_dir}/chr_list.txt!\n";
-	while(<$temp_fh>){
-		chomp;
-		my $temp_line = $_;
-		push(@temp_chr, $temp_line);
+	my %temp_chr = ();
+	my %temp_query_fh = ();
+	open(my $temp_query_in_fh, $temp_query) or die "Cannot open $temp_query!\n";
+	while(<$temp_query_in_fh>){
+		next if /^#/;
+		chomp(my $temp_line = $_);
+		my @temp_line = split('\t', $temp_line);
+		next unless (@temp_line >= 3) && ($temp_line[2] eq 'exon');
+		my $temp_cur_chr = $temp_line[0];
+		unless(exists $temp_chr{$temp_cur_chr}){
+			$temp_chr{$temp_cur_chr} = 1;
+			open($temp_query_fh{$temp_cur_chr}, "> ${temp_dir}/query_${temp_cur_chr}.gtf") or die "Cannot create ${temp_dir}/query_${temp_cur_chr}.gtf!\n";
+		}
+		print {$temp_query_fh{$temp_cur_chr}} "$temp_line\n";
 	}
-	close $temp_fh;
-	system("for i in `cat ${temp_dir}/chr_list.txt`; do grep \"^\$i\"\$\'\\t\' $temp_ref > ${temp_dir}/ref_\$\{i\}.gtf; done");
-	system("for i in `cat ${temp_dir}/chr_list.txt`; do grep \"^\$i\"\$\'\\t\' $temp_query > ${temp_dir}/query_\$\{i\}.gtf; done");
+	close $temp_query_in_fh;
+	foreach my $temp_cur_chr (keys %temp_query_fh){
+		close $temp_query_fh{$temp_cur_chr};
+	}
+	my @temp_chr = sort keys %temp_chr;
+	open(my $temp_chr_list_fh, "> ${temp_dir}/chr_list.txt") or die "Cannot create ${temp_dir}/chr_list.txt!\n";
+	print $temp_chr_list_fh join("\n", @temp_chr) . "\n" if @temp_chr;
+	close $temp_chr_list_fh;
+
+	my %temp_ref_fh = ();
+	open(my $temp_ref_in_fh, $temp_ref) or die "Cannot open $temp_ref!\n";
+	while(<$temp_ref_in_fh>){
+		next if /^#/;
+		chomp(my $temp_line = $_);
+		my @temp_line = split('\t', $temp_line);
+		next unless (@temp_line >= 3) && ($temp_line[2] eq 'exon');
+		my $temp_cur_chr = $temp_line[0];
+		next unless exists $temp_chr{$temp_cur_chr};
+		unless(exists $temp_ref_fh{$temp_cur_chr}){
+			open($temp_ref_fh{$temp_cur_chr}, "> ${temp_dir}/ref_${temp_cur_chr}.gtf") or die "Cannot create ${temp_dir}/ref_${temp_cur_chr}.gtf!\n";
+		}
+		print {$temp_ref_fh{$temp_cur_chr}} "$temp_line\n";
+	}
+	close $temp_ref_in_fh;
+	foreach my $temp_cur_chr (keys %temp_ref_fh){
+		close $temp_ref_fh{$temp_cur_chr};
+	}
+
+	foreach my $temp_cur_chr (@temp_chr){
+		unless(exists $temp_ref_fh{$temp_cur_chr}){
+			open(my $temp_empty_fh, "> ${temp_dir}/ref_${temp_cur_chr}.gtf") or die "Cannot create ${temp_dir}/ref_${temp_cur_chr}.gtf!\n";
+			close $temp_empty_fh;
+		}
+	}
 
 	return \@temp_chr;
 }
 
-#Split bed file
 sub split_bed{
-	my ($temp_bed, $temp_dir) = @_;
-	system("for i in `cat ${temp_dir}/chr_list.txt`; do grep \"^\$i\"\$\'\\t\' $temp_bed > ${temp_dir}/query_\$\{i\}_tss.bed; done");
+	my ($temp_bed, $temp_dir, $temp_chr_ref) = @_;
+	my %temp_want = map { ($_, 1) } @$temp_chr_ref;
+	my %temp_fh = ();
+	open(my $temp_in_fh, $temp_bed) or die "Cannot open $temp_bed!\n";
+	while(<$temp_in_fh>){
+		chomp(my $temp_line = $_);
+		$temp_line =~ s/\r$//;
+		next if $temp_line eq '';
+		my @temp_line = split('\t', $temp_line);
+		my $temp_cur_chr = $temp_line[0];
+		next unless exists $temp_want{$temp_cur_chr};
+		unless(exists $temp_fh{$temp_cur_chr}){
+			open($temp_fh{$temp_cur_chr}, "> ${temp_dir}/query_${temp_cur_chr}_tss.bed") or die "Cannot create ${temp_dir}/query_${temp_cur_chr}_tss.bed!\n";
+		}
+		print {$temp_fh{$temp_cur_chr}} "$temp_line\n";
+	}
+	close $temp_in_fh;
+	foreach my $temp_cur_chr (keys %temp_fh){
+		close $temp_fh{$temp_cur_chr};
+	}
+
+	foreach my $temp_cur_chr (@$temp_chr_ref){
+		unless(exists $temp_fh{$temp_cur_chr}){
+			open(my $temp_empty_fh, "> ${temp_dir}/query_${temp_cur_chr}_tss.bed") or die "Cannot create ${temp_dir}/query_${temp_cur_chr}_tss.bed!\n";
+			close $temp_empty_fh;
+		}
+	}
 
 	return 1;
 }
@@ -758,7 +856,7 @@ sub read_bed{
 			%{$temp_bed{$temp_line[3]}} = ();
 			$temp_bed{$temp_line[3]}{'chr'} = $temp_line[0];
 			$temp_bed{$temp_line[3]}{'strand'} = $temp_line[5];
-			$temp_bed{$temp_line[3]}{'left'} = $temp_line[1] - 1;
+			$temp_bed{$temp_line[3]}{'left'} = $temp_line[1] + 1;
 			$temp_bed{$temp_line[3]}{'right'} = $temp_line[2];
 		}
 	}
@@ -1068,7 +1166,7 @@ sub print_exon{
 		$temp_num_exon = @{$temp_transcript_ref->{'exon'}};
 	}
 	foreach my $temp_exon_ref (@{$temp_transcript_ref->{'exon'}}){
-		print $temp_fh "$temp_transcript_ref->{'chr'}\tisoPropeller\texon\t$temp_exon_ref->[0]\t$temp_exon_ref->[1]\t.\t$temp_transcript_ref->{'strand'}\t.\ttranscript_id \"$temp_transcript_id\"\; exon_num \"$temp_num_exon\"\; gene_id \"$temp_gene_id\"\; gene_name \"$temp_gene_name\"\; gene_type \"$temp_gene_type\"\;";
+		print $temp_fh "$temp_transcript_ref->{'chr'}\tISOP\texon\t$temp_exon_ref->[0]\t$temp_exon_ref->[1]\t.\t$temp_transcript_ref->{'strand'}\t.\ttranscript_id \"$temp_transcript_id\"\; exon_num \"$temp_num_exon\"\; gene_id \"$temp_gene_id\"\; gene_name \"$temp_gene_name\"\; gene_type \"$temp_gene_type\"\;";
 		if($temp_asm_gene_id){
 			print $temp_fh " asm_gene_id \"$temp_asm_gene_id\"\;";
 		}
@@ -1113,7 +1211,7 @@ sub print_gene_transcript{
 	my ($temp_transcript_ref, $temp_gene_ref, $temp_gtf) = @_;
 	open(my $temp_fh, ">> $temp_gtf") or die "Cannot open $temp_gtf!\n";
 	foreach my $temp_gene_id (keys %$temp_gene_ref){
-		print $temp_fh "$temp_gene_ref->{$temp_gene_id}{'chr'}\tisoPropeller\tgene\t$temp_gene_ref->{$temp_gene_id}{'left'}\t$temp_gene_ref->{$temp_gene_id}{'right'}\t.\t$temp_gene_ref->{$temp_gene_id}{'strand'}\t.\tgene_id \"$temp_gene_id\"\;";
+		print $temp_fh "$temp_gene_ref->{$temp_gene_id}{'chr'}\tISOP\tgene\t$temp_gene_ref->{$temp_gene_id}{'left'}\t$temp_gene_ref->{$temp_gene_id}{'right'}\t.\t$temp_gene_ref->{$temp_gene_id}{'strand'}\t.\tgene_id \"$temp_gene_id\"\;";
 		if($temp_gene_ref->{$temp_gene_id}{'ref_gene_id'}){
 			print $temp_fh " ref_gene_id \"$temp_gene_ref->{$temp_gene_id}{'ref_gene_id'}\"\;";
 		}
@@ -1129,7 +1227,7 @@ sub print_gene_transcript{
 		print $temp_fh "\n";
 	}
 	foreach my $temp_transcript_id (keys %$temp_transcript_ref){
-		print $temp_fh "$temp_transcript_ref->{$temp_transcript_id}{'chr'}\tisoPropeller\ttranscript\t$temp_transcript_ref->{$temp_transcript_id}{'left'}\t$temp_transcript_ref->{$temp_transcript_id}{'right'}\t.\t$temp_transcript_ref->{$temp_transcript_id}{'strand'}\t.\ttranscript_id \"$temp_transcript_id\"\; gene_id \"$temp_transcript_ref->{$temp_transcript_id}{'gene_id'}\"\; gene_name \"$temp_transcript_ref->{$temp_transcript_id}{'gene_name'}\"\; gene_type \"$temp_transcript_ref->{$temp_transcript_id}{'gene_type'}\"\;";
+		print $temp_fh "$temp_transcript_ref->{$temp_transcript_id}{'chr'}\tISOP\ttranscript\t$temp_transcript_ref->{$temp_transcript_id}{'left'}\t$temp_transcript_ref->{$temp_transcript_id}{'right'}\t.\t$temp_transcript_ref->{$temp_transcript_id}{'strand'}\t.\ttranscript_id \"$temp_transcript_id\"\; gene_id \"$temp_transcript_ref->{$temp_transcript_id}{'gene_id'}\"\; gene_name \"$temp_transcript_ref->{$temp_transcript_id}{'gene_name'}\"\; gene_type \"$temp_transcript_ref->{$temp_transcript_id}{'gene_type'}\"\;";
 		if($temp_transcript_ref->{$temp_transcript_id}{'asm_gene_id'}){
 			print $temp_fh " asm_gene_id \"$temp_transcript_ref->{$temp_transcript_id}{'asm_gene_id'}\"\;";
 		}
@@ -2014,7 +2112,7 @@ sub print_intron{
 		for(my $i = 1; $i < $temp_num_exon; $i++){
 			my $temp_left = $temp_merged_exon[$i-1][1] + 1;
 			my $temp_right = $temp_merged_exon[$i][0] - 1;
-			print $temp_fh "$temp_gene_exon{$temp_gene_id}{'chr'}\tisoPropeller\tintron\t$temp_left\t$temp_right\t.\t$temp_gene_exon{$temp_gene_id}{'strand'}\t.\tgene_id \"$temp_gene_id\"\; gene_type \"$temp_gene_exon{$temp_gene_id}{'gene_type'}\"\;\n";
+			print $temp_fh "$temp_gene_exon{$temp_gene_id}{'chr'}\tISOP\tintron\t$temp_left\t$temp_right\t.\t$temp_gene_exon{$temp_gene_id}{'strand'}\t.\tgene_id \"$temp_gene_id\"\; gene_type \"$temp_gene_exon{$temp_gene_id}{'gene_type'}\"\;\n";
 		}
 	}
 	close $temp_fh;
@@ -2096,7 +2194,6 @@ sub classify_novel{
 			next;
 		}
 		#print "$temp_ref_gene_ref->{$temp_ref_gene_id}{'gene_type'}\n$temp_query_gene_id\t$temp_ref_gene_id\n";
-		#print "$temp_query_gene_id\t$temp_ref_gene_id\n";
 		if(exists $temp_class{$temp_query_gene_id}){
 			#print "Existing\n";
 			if($temp_class{$temp_query_gene_id}{'class'} eq 'ncRNA_host_gene'){
@@ -2175,6 +2272,7 @@ sub classify_novel{
 	while(<$temp_fh>){
 		chomp;
 		my $temp_line = $_;
+		#print "$temp_line\n";
 		my @temp_line = split('\t', $temp_line);
 		if(($temp_line[3] < $temp_line[12]) || ($temp_line[4] > $temp_line[13])){
 			next;
