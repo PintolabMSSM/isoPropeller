@@ -8,14 +8,17 @@ Change log:
 	v1.4	2023-12 Added an option to use TSS region bed file. Fixed an issue of getting gtf attributes. Removed bedtools.
 	v1.5	2024-04	Fixed a bug in clustering TSS regions by taking the entire region of the current TSS cluster instead of the region of the current transcript.
 	v1.6	2024-08	Added outputs of TSS-SJ IDs for all first and last splice junctions.
+	v1.7	2026-10	Replaced `threads` with fork()+waitpid(). Fixed the chromosome split issue. Fixed read_gtf().
 =cut
 
 use strict;
 use Getopt::Long;
-use threads;
+use POSIX qw(:sys_wait_h);
 use Benchmark qw(:hireswallclock);
 
-my $version = "v1.6";
+$| = 1;
+
+my $version = "v1.7";
 
 my $usage = "Usage: perl isoPropeller_TSS_clustering_${version}.pl
 	-i <String> Input gtf file
@@ -57,6 +60,7 @@ if($tss_region){
 }
 
 open(my $log_fh, "> ${out}.log") or die "Cannot create ${out}.log!\n";
+$log_fh->autoflush(1);
 
 my $dir = "${out}__isoPropeller_TSS_clustering_temp";
 if(-d $dir){
@@ -82,10 +86,10 @@ my $start_time = Benchmark->new;
 $date = `date $date_format`;
 chomp $date;
 print $log_fh "[$date]\tStarting preprocessing...\n";
-system("grep \$\'\\t\'\"exon\"\$\'\\t\' $in > ${dir}/exon.gtf");
+filter_exon($in, "${dir}/exon.gtf");
 my $chr_ref = split_gtf("${dir}/exon.gtf", $dir);
 if($tss_region){
-	split_bed($tss_region, $dir);
+	split_bed($tss_region, $dir, $chr_ref);
 }
 my $finish_time = Benchmark->new;
 my $time_spent = timediff($finish_time, $start_time);
@@ -94,30 +98,78 @@ chomp $date;
 print $log_fh "[$date]\tUsed ". timestr($time_spent) . " for preprocessing\n";
 
 my $chr_pos = 0;
-my @thread = ();
-my @running = ();
+my %running_pid_to_chr = ();
+my %failed = ();
 
-while(@thread < @$chr_ref){
-	@running = threads->list(threads::running);
-	if(@running < $num_thread){
-		my $thread = threads->create(\&worker, $chr_ref->[$chr_pos], $promoter, $tss_region, $dir, $date_format, $log_fh);
-		push(@thread, $thread);
-		$chr_pos++;
+sub reap_one{
+	my ($temp_log_fh, $temp_running_pid_to_chr_ref, $temp_failed_ref) = @_;
+	my $temp_pid = waitpid(-1, 0);
+	return 0 if $temp_pid <= 0;
+	my $temp_status = $?; #Capture immediately, before any other subprocess call (e.g. `date`) clobbers $?.
+	my $temp_chr = delete $temp_running_pid_to_chr_ref->{$temp_pid};
+	return 0 unless defined $temp_chr;
+	my $temp_date = `date $date_format`;
+	chomp $temp_date;
+	if($temp_status != 0){
+		print $temp_log_fh "[$temp_date]\t<ERROR> Worker for $temp_chr failed (status $temp_status)!\n";
+		$temp_failed_ref->{'true'} = 1;
+		return 1;
+	}
+	unless(-e "${dir}/${temp_chr}_tss_cluster.bed"){
+		print $temp_log_fh "[$temp_date]\t<ERROR> Worker for $temp_chr reported success but ${dir}/${temp_chr}_tss_cluster.bed is missing!\n";
+		$temp_failed_ref->{'true'} = 1;
+		return 1;
+	}
+	print $temp_log_fh "[$temp_date]\tJoined for $temp_chr!\n";
+	return 1;
+}
+
+while($chr_pos < @$chr_ref || %running_pid_to_chr){
+	if($chr_pos < @$chr_ref && (scalar(keys %running_pid_to_chr) < $num_thread)){
+		my $chr = $chr_ref->[$chr_pos];
+		my $pid = fork();
+		unless(defined $pid){
+			die "<ERROR> fork() failed: $!\n";
+		}
+		if($pid == 0){
+			worker($chr, $promoter, $tss_region, $dir, $date_format, $log_fh);
+			POSIX::_exit(0);
+		}
+		else{
+			$running_pid_to_chr{$pid} = $chr;
+			$chr_pos++;
+		}
+	}
+	else{
+		reap_one($log_fh, \%running_pid_to_chr, \%failed);
 	}
 }
 
-foreach my $thread (@thread){
-	$thread->join();
+if(exists $failed{'true'}){
+	$date = `date $date_format`;
+	chomp $date;
+	print $log_fh "[$date]\t<ERROR> At least one chromosome worker failed! Aborting before generating final output.\n";
+	print STDERR "<ERROR> At least one chromosome worker failed! See ${out}.log for details. Aborting before generating final output.\n";
+	close $log_fh;
+	exit(1);
 }
 
 system("cat ${dir}/*_tss_cluster.bed | sort -k 1,1 -k2,2n > ${out}.bed");
-system("echo \"tss_sj_id\"\$\'\\t\'\"transcript_id\" > ${out}_transcript.txt");
+open(my $temp_transcript_header_fh, "> ${out}_transcript.txt") or die "<ERROR> Cannot create ${out}_transcript.txt!\n";
+print $temp_transcript_header_fh "tss_sj_id\ttranscript_id\n";
+close $temp_transcript_header_fh;
 system("cat ${dir}/*_transcript.txt | sort -k 1 >> ${out}_transcript.txt");
-system("echo \"sj_id\"\$\'\\t\'\"tss_id\"\$\'\\t\'\"num_tss\"\$\'\\t\'\"transcript_id\"\$\'\\t\'\"num_transcript\" > ${out}_per_sj.txt");
+open(my $temp_per_sj_header_fh, "> ${out}_per_sj.txt") or die "<ERROR> Cannot create ${out}_per_sj.txt!\n";
+print $temp_per_sj_header_fh "sj_id\ttss_id\tnum_tss\ttranscript_id\tnum_transcript\n";
+close $temp_per_sj_header_fh;
 system("cat ${dir}/*_per_sj.txt | sort -k 1 >> ${out}_per_sj.txt");
-system("echo \"tss_sj_id\" > ${out}_first_sj.txt");
+open(my $temp_first_sj_header_fh, "> ${out}_first_sj.txt") or die "<ERROR> Cannot create ${out}_first_sj.txt!\n";
+print $temp_first_sj_header_fh "tss_sj_id\n";
+close $temp_first_sj_header_fh;
 system("cat ${dir}/*_first_sj.txt >> ${out}_first_sj.txt");
-system("echo \"tss_sj_id\" > ${out}_last_sj.txt");
+open(my $temp_last_sj_header_fh, "> ${out}_last_sj.txt") or die "<ERROR> Cannot create ${out}_last_sj.txt!\n";
+print $temp_last_sj_header_fh "tss_sj_id\n";
+close $temp_last_sj_header_fh;
 system("cat ${dir}/*_last_sj.txt >> ${out}_last_sj.txt");
 
 system("rm -r ${dir}");
@@ -154,29 +206,79 @@ sub worker{
 	return 1;
 }
 
-#Split gtf 
+sub filter_exon{
+	my ($temp_in, $temp_out) = @_;
+	open(my $temp_in_fh, $temp_in) or die "<ERROR> Cannot open $temp_in!\n";
+	open(my $temp_out_fh, "> $temp_out") or die "<ERROR> Cannot create $temp_out!\n";
+	while(<$temp_in_fh>){
+		next if /^#/;
+		my @temp_field = split('\t', $_);
+		next unless @temp_field >= 3;
+		print $temp_out_fh $_ if $temp_field[2] eq 'exon';
+	}
+	close $temp_in_fh;
+	close $temp_out_fh;
+
+	return 1;
+}
+
 sub split_gtf{
 	my ($temp_gtf, $temp_dir) = @_;
-	my $temp_fh;
-	system("cut -f1 $temp_gtf | sort | uniq > ${temp_dir}/chr_list.txt");
-	my @temp_chr = ();
-	open($temp_fh, "${temp_dir}/chr_list.txt") or die "Cannot open ${temp_dir}/chr_list.txt!\n";
-	while(<$temp_fh>){
-		chomp;
+	my %temp_chr = ();
+	my %temp_fh = ();
+	open(my $temp_in_fh, $temp_gtf) or die "<ERROR> Cannot open $temp_gtf!\n";
+	while(<$temp_in_fh>){
 		my $temp_line = $_;
-		$temp_line =~ s/\r//;
-		push(@temp_chr, $temp_line);
+		my $temp_tab = index($temp_line, "\t");
+		next if $temp_tab == -1;
+		my $temp_chr = substr($temp_line, 0, $temp_tab);
+		$temp_chr =~ s/\r//;
+		unless(exists $temp_chr{$temp_chr}){
+			$temp_chr{$temp_chr} = 1;
+			open(my $temp_out_fh, "> ${temp_dir}/${temp_chr}.gtf") or die "<ERROR> Cannot create ${temp_dir}/${temp_chr}.gtf!\n";
+			$temp_fh{$temp_chr} = $temp_out_fh;
+		}
+		print { $temp_fh{$temp_chr} } $temp_line;
 	}
-	close $temp_fh;
-	system("for i in `cat ${temp_dir}/chr_list.txt`; do grep \"^\$i\"\$\'\\t\' $temp_gtf > ${temp_dir}/\$\{i\}.gtf; done");
+	close $temp_in_fh;
+	foreach my $temp_chr (keys %temp_fh){
+		close $temp_fh{$temp_chr};
+	}
 
+	my @temp_chr = keys %temp_chr;
 	return \@temp_chr;
 }
 
-#Split bed file
 sub split_bed{
-	my ($temp_bed, $temp_dir) = @_;
-	system("for i in `cat ${temp_dir}/chr_list.txt`; do grep \"^\$i\"\$\'\\t\' $temp_bed > ${temp_dir}/\$\{i\}_tss.bed; done");
+	my ($temp_bed, $temp_dir, $temp_chr_ref) = @_;
+	my %temp_valid_chr = map { $_ => 1 } @$temp_chr_ref;
+	my %temp_fh = ();
+	open(my $temp_in_fh, $temp_bed) or die "<ERROR> Cannot open $temp_bed!\n";
+	while(<$temp_in_fh>){
+		my $temp_line = $_;
+		my $temp_tab = index($temp_line, "\t");
+		next if $temp_tab == -1;
+		my $temp_chr = substr($temp_line, 0, $temp_tab);
+		$temp_chr =~ s/\r//;
+		next unless exists $temp_valid_chr{$temp_chr};
+		unless(exists $temp_fh{$temp_chr}){
+			open(my $temp_out_fh, "> ${temp_dir}/${temp_chr}_tss.bed") or die "<ERROR> Cannot create ${temp_dir}/${temp_chr}_tss.bed!\n";
+			$temp_fh{$temp_chr} = $temp_out_fh;
+		}
+		print { $temp_fh{$temp_chr} } $temp_line;
+	}
+	close $temp_in_fh;
+	foreach my $temp_chr (keys %temp_fh){
+		close $temp_fh{$temp_chr};
+	}
+
+	foreach my $temp_chr (@$temp_chr_ref){
+		my $temp_path = "${temp_dir}/${temp_chr}_tss.bed";
+		unless(-e $temp_path){
+			open(my $temp_empty_fh, "> $temp_path") or die "<ERROR> Cannot create $temp_path!\n";
+			close $temp_empty_fh;
+		}
+	}
 
 	return 1;
 }
@@ -216,7 +318,7 @@ sub read_gtf{
 		my $temp_num_col = @temp_line;
 		if($temp_num_col != 9){
 			print STDERR"<ERROR> $temp_line\nThe number of columns does not match the gtf format.\n";
-			exit;
+			exit(1); #Non-zero so the fork()-based scheduler's reap_one() correctly detects this as a worker failure.
 		}
 		my $temp_transcript_id;
 		if($temp_line[8] =~ /(^|\s)transcript_id \"([^\"]+)\"\;/){
@@ -224,7 +326,7 @@ sub read_gtf{
 		}
 		else{
 			print STDERR "<ERROR> Cannot find transcript ID at line:\n$temp_line\n";
-			exit;
+			exit(1); #Non-zero so the fork()-based scheduler's reap_one() correctly detects this as a worker failure.
 		}
 		my $temp_gene_id;
 		if($temp_line[8] =~ /(^|\s)gene_id \"([^\"]+)\"\;/){
@@ -232,7 +334,7 @@ sub read_gtf{
 		}
 		else{
 			print STDERR "<ERROR> Cannot find gene ID at line:\n$temp_line\n";
-			exit;
+			exit(1); #Non-zero so the fork()-based scheduler's reap_one() correctly detects this as a worker failure.
 		}
 		my $temp_gene_type;
 		if($temp_line[8] =~ /(^|\s)gene_type \"([^\"]+)\"\;/){
