@@ -1,4 +1,4 @@
-#!/user/bin/env perl
+#!/usr/bin/env perl
 =start
 Author: ALin
 Purpose: To collapse RNA-seq long reads, perform splice junction correction based on the nearest splice junction provided by NGS or reference if available, and generate a .gtf file for all transcripts with unique structures.
@@ -14,7 +14,7 @@ Change log:
 	v1.8.2	2023-09	Use a hash for storing the 5' support data instead of tabix.
 	v1.8.3	2024-09	Fixed the bed file coordinate issue. Added an option to rescue predicted intrapriming reads ending in annotated exons.
 	v1.9	2026-06	Replaced intron GTF input to the STAR SJ.out.tab format and used the sum of n_uniquely_mapped and n_multi_mapped as coverage.
-	v1.10	2026-10	Replaced the ithreads-based scheduler with a fork()-based worker pool. Fixed a bug in splitting chromosomes.
+	v1.10	2026-10	Replaced the ithreads-based scheduler with a fork()-based worker pool. Fixed the chromosome split issue.
 =cut
 
 use strict;
@@ -280,60 +280,61 @@ print $log_fh "[$date]\tPreprocessing done!\n";
 
 my $chr_pos = 0;
 my %running_pid_to_chr = ();
-my $failed = 0;
+my %failed = ();
 my %read = ();
 
-#Reap a single finished child, pull its stats back in via Storable (fork()ed children
-#can't return Perl data structures the way threads->join() could), and update %read.
 sub reap_one{
+	my ($temp_log_fh, $temp_date_format, $temp_running_pid_to_chr_ref, $temp_failed_ref) = @_;
 	my $temp_pid = waitpid(-1, 0);
 	return 0 if $temp_pid <= 0;
-	my $temp_status = $?;
-	my $temp_chr = delete $running_pid_to_chr{$temp_pid};
+	my $temp_status = $?; #Capture immediately -- the `date` backtick below is itself a subprocess and would otherwise clobber $?.
+	my $temp_chr = delete $temp_running_pid_to_chr_ref->{$temp_pid};
 	return 0 unless defined $temp_chr;
-	my $temp_date = `date $date_format`;
+	my $temp_date = `date $temp_date_format`;
 	chomp $temp_date;
 	if($temp_status != 0){
-		print $log_fh "[$temp_date]\t<ERROR> Worker for $temp_chr failed (status $temp_status)!\n";
-		$failed = 1;
+		print $temp_log_fh "[$temp_date]\t<ERROR> Worker for $temp_chr failed (status $temp_status)!\n";
+		$temp_failed_ref->{'true'} = 1;
 		return 1;
 	}
 	my $temp_stat_file = "${dir}/${temp_chr}_stat.dat";
 	unless(-e $temp_stat_file){
-		print $log_fh "[$temp_date]\t<ERROR> Worker for $temp_chr reported success but $temp_stat_file is missing!\n";
-		$failed = 1;
+		print $temp_log_fh "[$temp_date]\t<ERROR> Worker for $temp_chr reported success but $temp_stat_file is missing!\n";
+		$temp_failed_ref->{'true'} = 1;
 		return 1;
 	}
 	my $temp_result_ref = retrieve($temp_stat_file);
 	@{$read{$temp_chr}} = ($temp_result_ref->[0], $temp_result_ref->[1]);
-	print $log_fh "[$temp_date]\tJoined for $temp_chr!\n";
+	print $temp_log_fh "[$temp_date]\tJoined for $temp_chr!\n";
 
 	return 1;
 }
 
 while($chr_pos < @$chr_ref || %running_pid_to_chr){
 	if($chr_pos < @$chr_ref && (scalar(keys %running_pid_to_chr) < $num_thread)){
-		my $temp_chr = $chr_ref->[$chr_pos];
-		my $temp_pid = fork();
-		unless(defined $temp_pid){
+		my $chr = $chr_ref->[$chr_pos];
+		my $pid = fork();
+		unless(defined $pid){
 			die "<ERROR> fork() failed: $!\n";
 		}
-		if($temp_pid == 0){
-			worker($log_fh, $temp_chr, $dir, $mapq, $prefix, $min_junc_dist, $junc, $junc_dist, $end_dist, $polya, $genome, $window, $frac_a_min, $length_a_min, $fprime, $fprime_dist, $ipr, $stp);
+		if($pid == 0){
+			#Child
+			worker($log_fh, $chr, $dir, $mapq, $prefix, $min_junc_dist, $junc, $junc_dist, $end_dist, $polya, $genome, $window, $frac_a_min, $length_a_min, $fprime, $fprime_dist, $ipr, $stp);
 			POSIX::_exit(0);
 		}
 		else{
-			$running_pid_to_chr{$temp_pid} = $temp_chr;
+			#Parent
+			$running_pid_to_chr{$pid} = $chr;
 			$chr_pos++;
 		}
 	}
 	else{
-		reap_one();
+		reap_one($log_fh, $date_format, \%running_pid_to_chr, \%failed);
 	}
 }
 
-if($failed){
-	my $date = `date $date_format`;
+if(exists $failed{'true'}){
+	$date = `date $date_format`;
 	chomp $date;
 	print $log_fh "[$date]\t<ERROR> At least one chromosome worker failed! Aborting before generating final output.\n";
 	print STDERR "<ERROR> At least one chromosome worker failed! See ${out}.log for details. Aborting before generating final output.\n";
@@ -473,6 +474,10 @@ sub worker{
 	#print "Correction failed: $temp_num_filtered_junc_dist\n";
 	#print "Returning %temp_read $temp_chr $temp_num_filtered_junc_dist\n";
 
+	#fork()ed children can't hand a Perl data structure back to the parent via a return
+	#value the way threads->join() could; serialize the stats the parent needs for
+	#print_stat() to a small per-chromosome file instead, which the parent retrieves
+	#after reaping this child (see reap_one()).
 	my @temp_result = (\%temp_read, $temp_num_filtered_junc_dist);
 	nstore(\@temp_result, "${temp_dir}/${temp_chr}_stat.dat");
 
@@ -534,6 +539,10 @@ sub split_bam{
 }
 
 #Split the reference eejs of different chromosomes into different files.
+#Replaces a previous per-chromosome `system("grep \"^$chr\"$'\t' ...")`: that relied on
+#bash/ksh ANSI-C quoting ($'\t') for a literal tab, which a non-bash /bin/sh (e.g. dash)
+#does not interpret, so the grep silently matched nothing there. This native single pass
+#also turns an O(chromosomes x file size) rescan into a single O(file size) pass.
 sub split_ref_eej{
 	my ($temp_chr_ref, $temp_dir, $temp_junc) = @_;
 	my %temp_valid_chr = map { ($_, 1) } @$temp_chr_ref;
@@ -554,7 +563,9 @@ sub split_ref_eej{
 	foreach my $temp_chr (keys %temp_out_fh){
 		close $temp_out_fh{$temp_chr};
 	}
-
+	#read_ref_eej() is called unconditionally by every worker when -x is given, so every
+	#known chromosome needs a file even if nothing matched it (matching the original,
+	#where `grep ... > file` always creates the file via the redirect regardless of hits).
 	foreach my $temp_chr (@$temp_chr_ref){
 		unless(exists $temp_out_fh{$temp_chr}){
 			open(my $temp_ofh, "> ${temp_dir}/${temp_chr}_SJ.out.tab") or die "<ERROR> Cannot create ${temp_dir}/${temp_chr}_SJ.out.tab!\n";
@@ -566,6 +577,11 @@ sub split_ref_eej{
 }
 
 #Split the poly-A result from nanopolish polya of different chromosomes into different files.
+#Replaces per-chromosome `system("grep $'\t'\"$chr\"$'\t' ...")` (same dash-breaking ANSI-C
+#quoting bug as above). That pattern required $chr to exactly fill an INTERIOR
+#tab-delimited field (not the first or last column, since those lack a flanking tab on one
+#side) -- reproduced here by checking interior fields directly instead of a whole-line
+#regex, which is both correct and avoids rescanning the file once per chromosome.
 sub split_polya{
 	my ($temp_chr_ref, $temp_dir, $temp_polya) = @_;
 	my %temp_valid_chr = map { ($_, 1) } @$temp_chr_ref;
@@ -630,6 +646,7 @@ sub split_genome{
 }
 
 #Split the region file, including bed and gtf, of different chromosomes into different files.
+#Same dash/bash ANSI-C quoting bug as split_ref_eej, same native single-pass fix.
 sub split_region{
 	my ($temp_chr_ref, $temp_dir, $temp_bed, $temp_type, $temp_format) = @_;
 	my %temp_type = (fprime => 1, ipr => 1);
@@ -659,6 +676,8 @@ sub split_region{
 	foreach my $temp_chr (keys %temp_out_fh){
 		close $temp_out_fh{$temp_chr};
 	}
+	#read_five_prime()/read_ip_rescue() are called unconditionally by every worker when
+	#-f/-l is given, so every known chromosome needs a file even if nothing matched it.
 	foreach my $temp_chr (@$temp_chr_ref){
 		unless(exists $temp_out_fh{$temp_chr}){
 			open(my $temp_ofh, "> ${temp_dir}/${temp_chr}_${temp_type}.${temp_format}") or die "<ERROR> Cannot create ${temp_dir}/${temp_chr}_${temp_type}.${temp_format}!\n";
