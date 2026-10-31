@@ -30,6 +30,7 @@ Change logs:
 	v1.13	2024-09	Fixed the bed file left position issue.
 	v1.14	2026-10	Fixed split_gtf()/split_bed() with single native-Perl passes. Fixed read_bed() position issue. Fixed -b type.
 	v1.15	2026-10	Replaced the `threads`-based worker pool and its busy-wait scheduling loop with a fork()+waitpid worker pool.
+	v1.16	2026-10	Simplified output file.
 =cut
 
 use strict;
@@ -50,7 +51,7 @@ unless(-e $isop_merge){
 
 my $total_start_time = Benchmark->new;
 
-my $version = "v1.15";
+my $version = "v1.16";
 
 my ($ref, $query, $out, $max_p, $max_bd, $missing, $tss_region, $btp, $num_thread, $help) = ("", "", "", 100, 100, 0, "", "", 1, 0);
 
@@ -256,6 +257,7 @@ sub worker{
 	my %temp_pc_gene_type = ("protein_coding", 1);
 	my %temp_immune_gene_type = ("IG_C_gene", 1, "IG_C_pseudogene", 1, "IG_D_gene", 1, "IG_J_gene", 1, "IG_J_pseudogene", 1, "IG_pseudogene", 1, "IG_V_gene", 1, "IG_V_pseudogene", 1, "TR_C_gene", 1, "TR_D_gene", 1, "TR_J_gene", 1, "TR_J_pseudogene", 1, "TR_V_gene", 1, "TR_V_pseudogene", 1);
 	my %temp_novel_cluster_count = ();
+	my %temp_transcript_meta = ();
 	my $temp_date = `date $temp_date_format`;
 	chomp $temp_date;
 	print "[isoPropeller_annotate $temp_date]\tStarting to process $temp_chr...\n";
@@ -266,56 +268,56 @@ sub worker{
 		($temp_tss_ref) = read_bed("${temp_dir}/query_${temp_chr}_tss.bed");
 	}
 	#Initial pass annotation: Identify novel genes not overlapping any reference genes and create the loci information by adding them to the reference
-	my ($temp_ref_transcript_ref, $temp_ref_gene_ref) = read_gtf("${temp_dir}/ref_${temp_chr}.gtf", $temp_tss_ref);
-	my ($temp_query_transcript_ref, $temp_query_gene_ref) = read_gtf("${temp_dir}/query_${temp_chr}.gtf", $temp_tss_ref);
+	my ($temp_ref_transcript_ref, $temp_ref_gene_ref) = read_gtf("${temp_dir}/ref_${temp_chr}.gtf", $temp_tss_ref, \%temp_transcript_meta);
+	my ($temp_query_transcript_ref, $temp_query_gene_ref) = read_gtf("${temp_dir}/query_${temp_chr}.gtf", $temp_tss_ref, \%temp_transcript_meta);
 	classify_novel_initial(
-		$temp_ref_gene_ref, 
-		$temp_query_transcript_ref, 
-		"${temp_dir}/query_${temp_chr}_transcript.gtf", 
-		"${temp_dir}/query_${temp_chr}_transcript_tss.gtf", 
-		"${temp_dir}/ref_${temp_chr}_gene.gtf", 
-		"${temp_dir}/ref_${temp_chr}_gene_tss.gtf", 
-		"${temp_dir}/query_${temp_chr}_novel_ref.gtf", 
-		"${temp_dir}/query_${temp_chr}_novel.gtf", 
-		$temp_btp
+		$temp_ref_gene_ref,
+		$temp_query_transcript_ref,
+		"${temp_dir}/query_${temp_chr}_transcript.gtf",
+		"${temp_dir}/query_${temp_chr}_transcript_tss.gtf",
+		"${temp_dir}/ref_${temp_chr}_gene.gtf",
+		"${temp_dir}/ref_${temp_chr}_gene_tss.gtf",
+		"${temp_dir}/query_${temp_chr}_novel_ref.gtf",
+		"${temp_dir}/query_${temp_chr}_novel.gtf",
+		$temp_btp,
+		\%temp_transcript_meta
 	);
 	recluster_novel(
-		\%temp_novel_cluster_count, 
-		"${temp_dir}/query_${temp_chr}_novel_ref.gtf", 
-		"${temp_dir}/query_${temp_chr}_novel_ref_reclustered.gtf"
+		\%temp_novel_cluster_count,
+		"${temp_dir}/query_${temp_chr}_novel_ref.gtf",
+		"${temp_dir}/query_${temp_chr}_novel_ref_reclustered.gtf",
+		\%temp_transcript_meta
 	);
 	system("cat ${temp_dir}/ref_${temp_chr}.gtf ${temp_dir}/query_${temp_chr}_novel_ref_reclustered.gtf > ${temp_dir}/ref_${temp_chr}_expanded.gtf");
 	system("echo ${temp_dir}/ref_${temp_chr}_expanded.gtf > ${temp_dir}/ref_${temp_chr}_gtf_list.txt");
-	#isoPropeller_merge has no -b option (it never calls bedtools itself); passing one
-	#through here used to just make it print "Unknown option: b" and drop the
-	#value, once per chromosome.
 	system("perl $temp_isop_merge -i ${temp_dir}/ref_${temp_chr}_gtf_list.txt -o ${temp_dir}/ref_${temp_chr}_expanded_merged");
 	my $temp_loci_ref = read_loci_id("${temp_dir}/ref_${temp_chr}_expanded_merged_id.txt");
 
 	#1st-pass annotation: Identify annotated, fusion and novel transcripts of known genes and those of novel genes
-	($temp_ref_transcript_ref, $temp_ref_gene_ref) = read_gtf("${temp_dir}/ref_${temp_chr}_expanded.gtf", $temp_tss_ref);
-	($temp_query_transcript_ref, $temp_query_gene_ref) = read_gtf("${temp_dir}/query_${temp_chr}_novel.gtf", $temp_tss_ref);
+	($temp_ref_transcript_ref, $temp_ref_gene_ref) = read_gtf("${temp_dir}/ref_${temp_chr}_expanded.gtf", $temp_tss_ref, \%temp_transcript_meta);
+	($temp_query_transcript_ref, $temp_query_gene_ref) = read_gtf("${temp_dir}/query_${temp_chr}_novel.gtf", $temp_tss_ref, \%temp_transcript_meta);
 	my $temp_map_ref = compare_transcript(
-		\%temp_monoexonic_gene_type, 
-		$temp_max_p, 
-		"${temp_dir}/ref_${temp_chr}_expanded.gtf", 
-		"${temp_dir}/query_${temp_chr}_novel.gtf", 
-		$temp_ref_transcript_ref, 
-		$temp_query_transcript_ref, 
-		$temp_ref_gene_ref, 
+		\%temp_monoexonic_gene_type,
+		$temp_max_p,
+		"${temp_dir}/ref_${temp_chr}_expanded.gtf",
+		"${temp_dir}/query_${temp_chr}_novel.gtf",
+		$temp_ref_transcript_ref,
+		$temp_query_transcript_ref,
+		$temp_ref_gene_ref,
 		$temp_btp
 	);
 	evaluate_transcript(
-		1, 
-		\%temp_monoexonic_gene_type, 
-		$temp_map_ref, $temp_loci_ref, 
-		$temp_ref_transcript_ref, 
-		$temp_query_transcript_ref, 
-		$temp_ref_gene_ref, 
-		"${temp_dir}/query_${temp_chr}_annotated.gtf", 
-		"${temp_dir}/query_${temp_chr}_fusion.gtf", 
-		"${temp_dir}/query_${temp_chr}_novel_ref_reclustered.gtf", 
-		"${temp_dir}/query_${temp_chr}_novel.gtf"
+		1,
+		\%temp_monoexonic_gene_type,
+		$temp_map_ref, $temp_loci_ref,
+		$temp_ref_transcript_ref,
+		$temp_query_transcript_ref,
+		$temp_ref_gene_ref,
+		"${temp_dir}/query_${temp_chr}_annotated.gtf",
+		"${temp_dir}/query_${temp_chr}_fusion.gtf",
+		"${temp_dir}/query_${temp_chr}_novel_ref_reclustered.gtf",
+		"${temp_dir}/query_${temp_chr}_novel.gtf",
+		\%temp_transcript_meta
 	);
 	$temp_date = `date $temp_date_format`;
 	chomp $temp_date;
@@ -331,30 +333,31 @@ sub worker{
 		$temp_novel_ref_last_size = $temp_novel_ref_cur_size;
 		$temp_novel_last_size = $temp_novel_cur_size;
 		system("cat ${temp_dir}/query_${temp_chr}_annotated.gtf ${temp_dir}/query_${temp_chr}_novel_ref_reclustered.gtf > ${temp_dir}/ref_${temp_chr}_expanded.gtf");
-		my ($temp_ref_expanded_transcript_ref, $temp_ref_expanded_gene_ref) = read_gtf("${temp_dir}/ref_${temp_chr}_expanded.gtf", $temp_tss_ref);
-		my ($temp_query_novel_transcript_ref, $temp_query_novel_gene_ref) = read_gtf("${temp_dir}/query_${temp_chr}_novel.gtf", $temp_tss_ref);
+		my ($temp_ref_expanded_transcript_ref, $temp_ref_expanded_gene_ref) = read_gtf("${temp_dir}/ref_${temp_chr}_expanded.gtf", $temp_tss_ref, \%temp_transcript_meta);
+		my ($temp_query_novel_transcript_ref, $temp_query_novel_gene_ref) = read_gtf("${temp_dir}/query_${temp_chr}_novel.gtf", $temp_tss_ref, \%temp_transcript_meta);
 		$temp_map_ref = compare_transcript(
-			\%temp_monoexonic_gene_type, 
-			$temp_max_p, 
-			"${temp_dir}/ref_${temp_chr}_expanded.gtf", 
-			"${temp_dir}/query_${temp_chr}_novel.gtf", 
-			$temp_ref_expanded_transcript_ref, 
-			$temp_query_novel_transcript_ref, 
-			$temp_ref_gene_ref, 
+			\%temp_monoexonic_gene_type,
+			$temp_max_p,
+			"${temp_dir}/ref_${temp_chr}_expanded.gtf",
+			"${temp_dir}/query_${temp_chr}_novel.gtf",
+			$temp_ref_expanded_transcript_ref,
+			$temp_query_novel_transcript_ref,
+			$temp_ref_gene_ref,
 			$temp_btp
 		);
 		evaluate_transcript(
-			2, 
-			\%temp_monoexonic_gene_type, 
-			$temp_map_ref, 
-			$temp_loci_ref, 
-			$temp_ref_expanded_transcript_ref, 
-			$temp_query_novel_transcript_ref, 
-			$temp_ref_expanded_gene_ref, 
-			"${temp_dir}/query_${temp_chr}_annotated.gtf", 
-			"${temp_dir}/query_${temp_chr}_fusion.gtf", 
-			"${temp_dir}/query_${temp_chr}_novel_ref_reclustered.gtf", 
-			"${temp_dir}/query_${temp_chr}_novel.gtf"
+			2,
+			\%temp_monoexonic_gene_type,
+			$temp_map_ref,
+			$temp_loci_ref,
+			$temp_ref_expanded_transcript_ref,
+			$temp_query_novel_transcript_ref,
+			$temp_ref_expanded_gene_ref,
+			"${temp_dir}/query_${temp_chr}_annotated.gtf",
+			"${temp_dir}/query_${temp_chr}_fusion.gtf",
+			"${temp_dir}/query_${temp_chr}_novel_ref_reclustered.gtf",
+			"${temp_dir}/query_${temp_chr}_novel.gtf",
+			\%temp_transcript_meta
 		);
 		$temp_novel_ref_cur_size = -s "${temp_dir}/query_${temp_chr}_novel_ref_reclustered.gtf";
 		$temp_novel_cur_size = -s "${temp_dir}/query_${temp_chr}_novel.gtf";
@@ -374,29 +377,30 @@ sub worker{
 		$temp_novel_ref_last_size = $temp_novel_ref_cur_size;
 		$temp_novel_last_size = $temp_novel_cur_size;
 		system("cat ${temp_dir}/query_${temp_chr}_fusion.gtf > ${temp_dir}/ref_${temp_chr}_expanded.gtf");
-		my ($temp_ref_expanded_transcript_ref, $temp_ref_expanded_gene_ref) = read_gtf("${temp_dir}/ref_${temp_chr}_expanded.gtf", $temp_tss_ref);
-		my ($temp_query_novel_transcript_ref, $temp_query_novel_gene_ref) = read_gtf("${temp_dir}/query_${temp_chr}_novel.gtf", $temp_tss_ref);
+		my ($temp_ref_expanded_transcript_ref, $temp_ref_expanded_gene_ref) = read_gtf("${temp_dir}/ref_${temp_chr}_expanded.gtf", $temp_tss_ref, \%temp_transcript_meta);
+		my ($temp_query_novel_transcript_ref, $temp_query_novel_gene_ref) = read_gtf("${temp_dir}/query_${temp_chr}_novel.gtf", $temp_tss_ref, \%temp_transcript_meta);
 		$temp_map_ref = compare_transcript(
-			\%temp_monoexonic_gene_type, 
-			$temp_max_p, 
-			"${temp_dir}/ref_${temp_chr}_expanded.gtf", 
-			"${temp_dir}/query_${temp_chr}_novel.gtf", 
-			$temp_ref_expanded_transcript_ref, 
-			$temp_query_novel_transcript_ref, 
-			$temp_ref_gene_ref, 
+			\%temp_monoexonic_gene_type,
+			$temp_max_p,
+			"${temp_dir}/ref_${temp_chr}_expanded.gtf",
+			"${temp_dir}/query_${temp_chr}_novel.gtf",
+			$temp_ref_expanded_transcript_ref,
+			$temp_query_novel_transcript_ref,
+			$temp_ref_gene_ref,
 			$temp_btp
 		);
 		evaluate_transcript(
-			3, 
-			\%temp_monoexonic_gene_type, 
-			$temp_map_ref, $temp_loci_ref, 
-			$temp_ref_expanded_transcript_ref, 
-			$temp_query_novel_transcript_ref, 
-			$temp_ref_expanded_gene_ref, 
-			"${temp_dir}/query_${temp_chr}_annotated.gtf", 
-			"${temp_dir}/query_${temp_chr}_fusion.gtf", 
-			"${temp_dir}/query_${temp_chr}_novel_ref_reclustered.gtf", 
-			"${temp_dir}/query_${temp_chr}_novel.gtf"
+			3,
+			\%temp_monoexonic_gene_type,
+			$temp_map_ref, $temp_loci_ref,
+			$temp_ref_expanded_transcript_ref,
+			$temp_query_novel_transcript_ref,
+			$temp_ref_expanded_gene_ref,
+			"${temp_dir}/query_${temp_chr}_annotated.gtf",
+			"${temp_dir}/query_${temp_chr}_fusion.gtf",
+			"${temp_dir}/query_${temp_chr}_novel_ref_reclustered.gtf",
+			"${temp_dir}/query_${temp_chr}_novel.gtf",
+			\%temp_transcript_meta
 		);
 		$temp_novel_ref_cur_size = -s "${temp_dir}/query_${temp_chr}_novel_ref_reclustered.gtf";
 		$temp_novel_cur_size = -s "${temp_dir}/query_${temp_chr}_novel.gtf";
@@ -407,29 +411,30 @@ sub worker{
 	}
 
 	#4th-pass annotation: Annotate novel monoexonic transcripts the overlapping monoexonic transcripts
-	my ($temp_query_novel_transcript_ref, $temp_query_novel_gene_ref) = read_gtf("${temp_dir}/query_${temp_chr}_novel.gtf", $temp_tss_ref);
+	my ($temp_query_novel_transcript_ref, $temp_query_novel_gene_ref) = read_gtf("${temp_dir}/query_${temp_chr}_novel.gtf", $temp_tss_ref, \%temp_transcript_meta);
 	$temp_map_ref = compare_transcript(
-		\%temp_monoexonic_gene_type, 
-		$temp_max_p, 
-		"${temp_dir}/ref_${temp_chr}.gtf", 
-		"${temp_dir}/query_${temp_chr}_novel.gtf", 
-		$temp_ref_transcript_ref, 
-		$temp_query_novel_transcript_ref, 
-		$temp_ref_gene_ref, 
+		\%temp_monoexonic_gene_type,
+		$temp_max_p,
+		"${temp_dir}/ref_${temp_chr}.gtf",
+		"${temp_dir}/query_${temp_chr}_novel.gtf",
+		$temp_ref_transcript_ref,
+		$temp_query_novel_transcript_ref,
+		$temp_ref_gene_ref,
 		$temp_btp
 	);
 	evaluate_transcript(
-		4, 
-		\%temp_monoexonic_gene_type, 
-		$temp_map_ref, 
-		$temp_loci_ref, 
-		$temp_ref_transcript_ref, 
-		$temp_query_novel_transcript_ref, 
-		$temp_ref_gene_ref, 
-		"${temp_dir}/query_${temp_chr}_annotated.gtf", 
-		"${temp_dir}/query_${temp_chr}_fusion.gtf", 
-		"${temp_dir}/query_${temp_chr}_novel_ref_reclustered.gtf", 
-		"${temp_dir}/query_${temp_chr}_novel.gtf"
+		4,
+		\%temp_monoexonic_gene_type,
+		$temp_map_ref,
+		$temp_loci_ref,
+		$temp_ref_transcript_ref,
+		$temp_query_novel_transcript_ref,
+		$temp_ref_gene_ref,
+		"${temp_dir}/query_${temp_chr}_annotated.gtf",
+		"${temp_dir}/query_${temp_chr}_fusion.gtf",
+		"${temp_dir}/query_${temp_chr}_novel_ref_reclustered.gtf",
+		"${temp_dir}/query_${temp_chr}_novel.gtf",
+		\%temp_transcript_meta
 	);
 	$temp_date = `date $temp_date_format`;
 	chomp $temp_date;
@@ -445,23 +450,24 @@ sub worker{
 		$temp_novel_ref_last_size = $temp_novel_ref_cur_size;
 		$temp_novel_last_size = $temp_novel_cur_size;
 		system("cat ${temp_dir}/ref_${temp_chr}.gtf ${temp_dir}/query_${temp_chr}_annotated.gtf ${temp_dir}/query_${temp_chr}_novel_ref_reclustered.gtf > ${temp_dir}/ref_${temp_chr}_expanded.gtf");
-		my ($temp_ref_expanded_transcript_ref, $temp_ref_expanded_gene_ref) = read_gtf("${temp_dir}/ref_${temp_chr}_expanded.gtf", $temp_tss_ref);
-		my ($temp_query_novel_transcript_ref, $temp_query_novel_gene_ref) = read_gtf("${temp_dir}/query_${temp_chr}_novel.gtf", $temp_tss_ref);
+		my ($temp_ref_expanded_transcript_ref, $temp_ref_expanded_gene_ref) = read_gtf("${temp_dir}/ref_${temp_chr}_expanded.gtf", $temp_tss_ref, \%temp_transcript_meta);
+		my ($temp_query_novel_transcript_ref, $temp_query_novel_gene_ref) = read_gtf("${temp_dir}/query_${temp_chr}_novel.gtf", $temp_tss_ref, \%temp_transcript_meta);
 		compare_tss(
-			\%temp_monoexonic_gene_type, 
-			$temp_max_p, 
-			$temp_loci_ref, 
-			$temp_ref_expanded_transcript_ref, 
-			$temp_query_novel_transcript_ref, 
-			$temp_ref_gene_ref, 
-			"${temp_dir}/ref_${temp_chr}_expanded_transcript.gtf", 
-			"${temp_dir}/query_${temp_chr}_novel_transcript.gtf", 
-			"${temp_dir}/ref_${temp_chr}_expanded_tss.gtf", 
-			"${temp_dir}/query_${temp_chr}_novel_tss.gtf", 
-			"${temp_dir}/query_${temp_chr}_annotated.gtf", 
-			"${temp_dir}/query_${temp_chr}_novel_ref_reclustered.gtf", 
-			"${temp_dir}/query_${temp_chr}_novel.gtf", 
-			$temp_btp
+			\%temp_monoexonic_gene_type,
+			$temp_max_p,
+			$temp_loci_ref,
+			$temp_ref_expanded_transcript_ref,
+			$temp_query_novel_transcript_ref,
+			$temp_ref_gene_ref,
+			"${temp_dir}/ref_${temp_chr}_expanded_transcript.gtf",
+			"${temp_dir}/query_${temp_chr}_novel_transcript.gtf",
+			"${temp_dir}/ref_${temp_chr}_expanded_tss.gtf",
+			"${temp_dir}/query_${temp_chr}_novel_tss.gtf",
+			"${temp_dir}/query_${temp_chr}_annotated.gtf",
+			"${temp_dir}/query_${temp_chr}_novel_ref_reclustered.gtf",
+			"${temp_dir}/query_${temp_chr}_novel.gtf",
+			$temp_btp,
+			\%temp_transcript_meta
 		);
 		$temp_novel_ref_cur_size = -s "${temp_dir}/query_${temp_chr}_novel_ref_reclustered.gtf";
 		$temp_novel_cur_size = -s "${temp_dir}/query_${temp_chr}_novel.gtf";
@@ -473,9 +479,10 @@ sub worker{
 
 	#Re-cluster novel transcripts
 	recluster_novel(
-		\%temp_novel_cluster_count, 
-		"${temp_dir}/query_${temp_chr}_novel.gtf", 
-		"${temp_dir}/query_${temp_chr}_novel_reclustered.gtf"
+		\%temp_novel_cluster_count,
+		"${temp_dir}/query_${temp_chr}_novel.gtf",
+		"${temp_dir}/query_${temp_chr}_novel_reclustered.gtf",
+		\%temp_transcript_meta
 	);
 	$temp_date = `date $temp_date_format`;
 	chomp $temp_date;
@@ -484,29 +491,30 @@ sub worker{
 	#Classify novel gene loci
 	system("cat ${temp_dir}/ref_${temp_chr}.gtf ${temp_dir}/query_${temp_chr}_annotated.gtf > ${temp_dir}/ref_${temp_chr}_expanded.gtf");
 	system("cat ${temp_dir}/query_${temp_chr}_novel_ref_reclustered.gtf >> ${temp_dir}/query_${temp_chr}_novel_reclustered.gtf");
-	my ($temp_ref_expanded_transcript_ref, $temp_ref_expanded_gene_ref) = read_gtf("${temp_dir}/ref_${temp_chr}_expanded.gtf", $temp_tss_ref);
-	my ($temp_query_novel_transcript_reclustered_ref, $temp_query_novel_gene_reclustered_ref) = read_gtf("${temp_dir}/query_${temp_chr}_novel_reclustered.gtf", $temp_tss_ref);
+	my ($temp_ref_expanded_transcript_ref, $temp_ref_expanded_gene_ref) = read_gtf("${temp_dir}/ref_${temp_chr}_expanded.gtf", $temp_tss_ref, \%temp_transcript_meta);
+	my ($temp_query_novel_transcript_reclustered_ref, $temp_query_novel_gene_reclustered_ref) = read_gtf("${temp_dir}/query_${temp_chr}_novel_reclustered.gtf", $temp_tss_ref, \%temp_transcript_meta);
 	classify_novel(
-		\%temp_monoexonic_gene_type, 
-		\%temp_pc_gene_type, 
-		$temp_max_bd, 
-		$temp_ref_expanded_transcript_ref, 
-		$temp_query_novel_transcript_reclustered_ref, 
-		$temp_ref_expanded_gene_ref, 
-		$temp_query_novel_gene_reclustered_ref, 
-		"${temp_dir}/ref_${temp_chr}_expanded.gtf", 
-		"${temp_dir}/query_${temp_chr}_novel_reclustered.gtf", 
-		"${temp_dir}/ref_${temp_chr}_expanded_gene.gtf", 
-		"${temp_dir}/ref_${temp_chr}_expanded_gene_tss.gtf", 
-		"${temp_dir}/ref_${temp_chr}_expanded_transcript.gtf", 
-		"${temp_dir}/ref_${temp_chr}_expanded_transcript_tss.gtf", 
-		"${temp_dir}/ref_${temp_chr}_expanded_intron.gtf", 
-		"${temp_dir}/query_${temp_chr}_novel_gene_reclustered.gtf", 
-		"${temp_dir}/query_${temp_chr}_novel_gene_reclustered_tss.gtf", 
-		"${temp_dir}/query_${temp_chr}_novel_transcript_reclustered.gtf", 
-		"${temp_dir}/query_${temp_chr}_novel_transcript_reclustered_tss.gtf", 
-		"${temp_dir}/query_${temp_chr}_novel_classified.gtf", 
-		$temp_btp
+		\%temp_monoexonic_gene_type,
+		\%temp_pc_gene_type,
+		$temp_max_bd,
+		$temp_ref_expanded_transcript_ref,
+		$temp_query_novel_transcript_reclustered_ref,
+		$temp_ref_expanded_gene_ref,
+		$temp_query_novel_gene_reclustered_ref,
+		"${temp_dir}/ref_${temp_chr}_expanded.gtf",
+		"${temp_dir}/query_${temp_chr}_novel_reclustered.gtf",
+		"${temp_dir}/ref_${temp_chr}_expanded_gene.gtf",
+		"${temp_dir}/ref_${temp_chr}_expanded_gene_tss.gtf",
+		"${temp_dir}/ref_${temp_chr}_expanded_transcript.gtf",
+		"${temp_dir}/ref_${temp_chr}_expanded_transcript_tss.gtf",
+		"${temp_dir}/ref_${temp_chr}_expanded_intron.gtf",
+		"${temp_dir}/query_${temp_chr}_novel_gene_reclustered.gtf",
+		"${temp_dir}/query_${temp_chr}_novel_gene_reclustered_tss.gtf",
+		"${temp_dir}/query_${temp_chr}_novel_transcript_reclustered.gtf",
+		"${temp_dir}/query_${temp_chr}_novel_transcript_reclustered_tss.gtf",
+		"${temp_dir}/query_${temp_chr}_novel_classified.gtf",
+		$temp_btp,
+		\%temp_transcript_meta
 	);
 	$temp_date = `date $temp_date_format`;
 	chomp $temp_date;
@@ -514,25 +522,26 @@ sub worker{
 
 	#Re-arrange the refernece gene IDs for fusion genes
 	system("cat ${temp_dir}/ref_${temp_chr}.gtf ${temp_dir}/query_${temp_chr}_annotated.gtf ${temp_dir}/query_${temp_chr}_novel_classified.gtf > ${temp_dir}/ref_${temp_chr}_expanded.gtf");
-	($temp_ref_expanded_transcript_ref, $temp_ref_expanded_gene_ref) = read_gtf("${temp_dir}/ref_${temp_chr}_expanded.gtf", $temp_tss_ref);
-	my ($temp_query_fusion_transcript_ref, $temp_query_fusion_gene_ref) = read_gtf("${temp_dir}/query_${temp_chr}_fusion.gtf", $temp_tss_ref);
+	($temp_ref_expanded_transcript_ref, $temp_ref_expanded_gene_ref) = read_gtf("${temp_dir}/ref_${temp_chr}_expanded.gtf", $temp_tss_ref, \%temp_transcript_meta);
+	my ($temp_query_fusion_transcript_ref, $temp_query_fusion_gene_ref) = read_gtf("${temp_dir}/query_${temp_chr}_fusion.gtf", $temp_tss_ref, \%temp_transcript_meta);
 	$temp_map_ref = compare_transcript(
-		\%temp_monoexonic_gene_type, 
-		$temp_max_p, 
-		"${temp_dir}/ref_${temp_chr}_expanded.gtf", 
-		"${temp_dir}/query_${temp_chr}_fusion.gtf", 
-		$temp_ref_expanded_transcript_ref, 
-		$temp_query_fusion_transcript_ref, 
-		$temp_ref_expanded_gene_ref, 
+		\%temp_monoexonic_gene_type,
+		$temp_max_p,
+		"${temp_dir}/ref_${temp_chr}_expanded.gtf",
+		"${temp_dir}/query_${temp_chr}_fusion.gtf",
+		$temp_ref_expanded_transcript_ref,
+		$temp_query_fusion_transcript_ref,
+		$temp_ref_expanded_gene_ref,
 		$temp_btp
 	);
 	rearrange_fusion(
 		\%temp_monoexonic_gene_type,
-		$temp_map_ref, 
-		$temp_ref_expanded_transcript_ref, 
-		$temp_ref_expanded_gene_ref, 
-		$temp_query_fusion_transcript_ref, 
-		"${temp_dir}/query_${temp_chr}_fusion.gtf"
+		$temp_map_ref,
+		$temp_ref_expanded_transcript_ref,
+		$temp_ref_expanded_gene_ref,
+		$temp_query_fusion_transcript_ref,
+		"${temp_dir}/query_${temp_chr}_fusion.gtf",
+		\%temp_transcript_meta
 	);
 	$temp_date = `date $temp_date_format`;
 	chomp $temp_date;
@@ -540,7 +549,7 @@ sub worker{
 
 	#Print exons
 	if($temp_missing){
-		print_missing($temp_ref_transcript_ref, "${temp_dir}/ref_${temp_chr}_missing.gtf");
+		print_missing($temp_ref_transcript_ref, "${temp_dir}/ref_${temp_chr}_missing.gtf", \%temp_transcript_meta);
 		system("cat ${temp_dir}/query_${temp_chr}_annotated.gtf ${temp_dir}/query_${temp_chr}_fusion.gtf ${temp_dir}/query_${temp_chr}_novel_classified.gtf ${temp_dir}/ref_${temp_chr}_missing.gtf > ${temp_dir}/${temp_chr}_out.gtf");
 	}
 	else{
@@ -551,7 +560,7 @@ sub worker{
 	print "[isoPropeller_annotate $temp_date]\tMerged output .gtf for $temp_chr!\n";
 
 	#Print genes and transcripts
-	my ($temp_out_transcript_ref, $temp_out_gene_ref) = read_gtf("${temp_dir}/${temp_chr}_out.gtf", $temp_tss_ref);
+	my ($temp_out_transcript_ref, $temp_out_gene_ref) = read_gtf("${temp_dir}/${temp_chr}_out.gtf", $temp_tss_ref, \%temp_transcript_meta);
 	print_gene_transcript(
 		$temp_out_transcript_ref, 
 		$temp_out_gene_ref, 
@@ -570,6 +579,7 @@ sub worker{
 	return $temp_chr;
 }
 
+#Split annotation
 sub split_gtf{
 	my ($temp_ref, $temp_query, $temp_dir) = @_;
 	my %temp_chr = ();
@@ -604,6 +614,7 @@ sub split_gtf{
 		my @temp_line = split('\t', $temp_line);
 		next unless (@temp_line >= 3) && ($temp_line[2] eq 'exon');
 		my $temp_cur_chr = $temp_line[0];
+		#Only split out chromosomes the query actually has exons on.
 		next unless exists $temp_chr{$temp_cur_chr};
 		unless(exists $temp_ref_fh{$temp_cur_chr}){
 			open($temp_ref_fh{$temp_cur_chr}, "> ${temp_dir}/ref_${temp_cur_chr}.gtf") or die "Cannot create ${temp_dir}/ref_${temp_cur_chr}.gtf!\n";
@@ -614,7 +625,6 @@ sub split_gtf{
 	foreach my $temp_cur_chr (keys %temp_ref_fh){
 		close $temp_ref_fh{$temp_cur_chr};
 	}
-
 	foreach my $temp_cur_chr (@temp_chr){
 		unless(exists $temp_ref_fh{$temp_cur_chr}){
 			open(my $temp_empty_fh, "> ${temp_dir}/ref_${temp_cur_chr}.gtf") or die "Cannot create ${temp_dir}/ref_${temp_cur_chr}.gtf!\n";
@@ -625,6 +635,7 @@ sub split_gtf{
 	return \@temp_chr;
 }
 
+#Split bed file
 sub split_bed{
 	my ($temp_bed, $temp_dir, $temp_chr_ref) = @_;
 	my %temp_want = map { ($_, 1) } @$temp_chr_ref;
@@ -646,7 +657,6 @@ sub split_bed{
 	foreach my $temp_cur_chr (keys %temp_fh){
 		close $temp_fh{$temp_cur_chr};
 	}
-
 	foreach my $temp_cur_chr (@$temp_chr_ref){
 		unless(exists $temp_fh{$temp_cur_chr}){
 			open(my $temp_empty_fh, "> ${temp_dir}/query_${temp_cur_chr}_tss.bed") or die "Cannot create ${temp_dir}/query_${temp_cur_chr}_tss.bed!\n";
@@ -659,7 +669,7 @@ sub split_bed{
 
 #Load gtf
 sub read_gtf{
-	my ($temp_gtf, $temp_tss_ref) = @_;
+	my ($temp_gtf, $temp_tss_ref, $temp_meta_ref) = @_;
 	open(my $temp_fh, "sort -k 1,1 -k 4,4n $temp_gtf |") or die "Cannot open $temp_gtf!\n";
 	my %temp_transcript = ();
 	my %temp_gene = ();
@@ -736,6 +746,15 @@ sub read_gtf{
 		my $temp_novel_gene_tag = 0;
 		if($temp_line[8] =~ /(^|\s)tag \"novel_gene\"\;/){
 			$temp_novel_gene_tag = 1;
+		}
+		if($temp_meta_ref && exists $temp_meta_ref->{$temp_transcript_id}){
+			my $temp_meta = $temp_meta_ref->{$temp_transcript_id};
+			$temp_status = $temp_meta->{'status'} if $temp_meta->{'status'};
+			$temp_ref_gene_id = $temp_meta->{'ref_gene_id'} if $temp_meta->{'ref_gene_id'};
+			$temp_ref_transcript_id = $temp_meta->{'ref_transcript_id'} if $temp_meta->{'ref_transcript_id'};
+			$temp_ref_gene_name = $temp_meta->{'ref_gene_name'} if $temp_meta->{'ref_gene_name'};
+			$temp_ref_gene_type = $temp_meta->{'ref_gene_type'} if $temp_meta->{'ref_gene_type'};
+			$temp_asm_gene_id = $temp_meta->{'asm_gene_id'} if $temp_meta->{'asm_gene_id'};
 		}
 		unless(exists $temp_transcript{$temp_transcript_id}){
 			%{$temp_transcript{$temp_transcript_id}} = ();
@@ -856,6 +875,10 @@ sub read_bed{
 			%{$temp_bed{$temp_line[3]}} = ();
 			$temp_bed{$temp_line[3]}{'chr'} = $temp_line[0];
 			$temp_bed{$temp_line[3]}{'strand'} = $temp_line[5];
+			#BED chromStart is 0-based; this script's own 'left'/'right'
+			#convention (set from gtf columns in read_gtf()) is 1-based, so
+			#converting chromStart requires +1, not -1. (Was "- 1": every TSS
+			#region loaded from -e came out shifted 2bp and 2bp too wide.)
 			$temp_bed{$temp_line[3]}{'left'} = $temp_line[1] + 1;
 			$temp_bed{$temp_line[3]}{'right'} = $temp_line[2];
 		}
@@ -867,7 +890,7 @@ sub read_bed{
 
 #Classify novel loci for the initial pass annotation
 sub classify_novel_initial{
-	my ($temp_ref_gene_ref, $temp_query_transcript_ref, $temp_query_transcript_gtf, $temp_query_transcript_tss_gtf, $temp_ref_gene_gtf, $temp_ref_gene_tss_gtf, $temp_query_novel_ref_gtf, $temp_query_novel_gtf, $temp_btp) = @_;
+	my ($temp_ref_gene_ref, $temp_query_transcript_ref, $temp_query_transcript_gtf, $temp_query_transcript_tss_gtf, $temp_ref_gene_gtf, $temp_ref_gene_tss_gtf, $temp_query_novel_ref_gtf, $temp_query_novel_gtf, $temp_btp, $temp_meta_ref) = @_;
 	#Create gene annotation for the reference
 	print_gene_tss(
 		"", 
@@ -900,13 +923,14 @@ sub classify_novel_initial{
 				$temp_query_transcript_ref->{$temp_query_transcript_id}{'gene_id'}, 
 				$temp_query_transcript_ref->{$temp_query_transcript_id}{'gene_name'}, 
 				$temp_query_transcript_ref->{$temp_query_transcript_id}{'gene_type'}, 
-				"", 
-				"", 
-				"", 
-				"", 
-				"", 
-				"", 
-				"novel_gene"
+				"",
+				"",
+				"",
+				"",
+				"",
+				"",
+				"novel_gene",
+				$temp_meta_ref
 			);
 			delete($temp_query_transcript_ref->{$temp_query_transcript_id});
 		}
@@ -929,7 +953,8 @@ sub classify_novel_initial{
 			"", 
 			"", 
 			"", 
-			""
+			"", 
+			$temp_meta_ref
 		);
 		delete $temp_query_transcript_ref->{$temp_query_transcript_id};
 	}
@@ -1160,37 +1185,38 @@ sub compare_transcript{
 
 #Print exons to .gtf
 sub print_exon{
-	my ($temp_fh, $temp_transcript_ref, $temp_transcript_id, $temp_gene_id, $temp_gene_name, $temp_gene_type, $temp_status, $temp_asm_gene_id, $temp_ref_transcript_id, $temp_ref_gene_id, $temp_ref_gene_name, $temp_ref_gene_type, $temp_tag) = @_;
+	my ($temp_fh, $temp_transcript_ref, $temp_transcript_id, $temp_gene_id, $temp_gene_name, $temp_gene_type, $temp_status, $temp_asm_gene_id, $temp_ref_transcript_id, $temp_ref_gene_id, $temp_ref_gene_name, $temp_ref_gene_type, $temp_tag, $temp_meta_ref) = @_;
+
+	my $temp_resolved_ref_gene_name = $temp_ref_gene_name;
+	if(!$temp_resolved_ref_gene_name && $temp_transcript_ref->{'ref_gene_name'}){
+		$temp_resolved_ref_gene_name = $temp_transcript_ref->{'ref_gene_name'};
+	}
+	my $temp_resolved_ref_gene_type = $temp_ref_gene_type;
+	if(!$temp_resolved_ref_gene_type && $temp_transcript_ref->{'ref_gene_type'}){
+		$temp_resolved_ref_gene_type = $temp_transcript_ref->{'ref_gene_type'};
+	}
+	if($temp_meta_ref){
+		#Last-write-wins: a transcript can be written more than once across the
+		#multi-pass pipeline (e.g. recorded as still-novel with blank metadata
+		#in an early pass, then finally classified with real status/ref_* values
+		#in a later pass), and the most recent call always reflects this
+		#transcript's current, authoritative classification.
+		$temp_meta_ref->{$temp_transcript_id} = {
+			'status' => $temp_status,
+			'asm_gene_id' => $temp_asm_gene_id,
+			'ref_transcript_id' => $temp_ref_transcript_id,
+			'ref_gene_id' => $temp_ref_gene_id,
+			'ref_gene_name' => $temp_resolved_ref_gene_name,
+			'ref_gene_type' => $temp_resolved_ref_gene_type,
+		};
+	}
+
 	my $temp_num_exon = 1;
 	if($temp_transcript_ref->{'strand'} eq '-'){
 		$temp_num_exon = @{$temp_transcript_ref->{'exon'}};
 	}
 	foreach my $temp_exon_ref (@{$temp_transcript_ref->{'exon'}}){
 		print $temp_fh "$temp_transcript_ref->{'chr'}\tISOP\texon\t$temp_exon_ref->[0]\t$temp_exon_ref->[1]\t.\t$temp_transcript_ref->{'strand'}\t.\ttranscript_id \"$temp_transcript_id\"\; exon_num \"$temp_num_exon\"\; gene_id \"$temp_gene_id\"\; gene_name \"$temp_gene_name\"\; gene_type \"$temp_gene_type\"\;";
-		if($temp_asm_gene_id){
-			print $temp_fh " asm_gene_id \"$temp_asm_gene_id\"\;";
-		}
-		if($temp_status){
-			print $temp_fh " status \"$temp_status\"\;";
-		}
-		if($temp_ref_transcript_id){
-			print $temp_fh " ref_transcript_id \"$temp_ref_transcript_id\"\;";
-		}
-		if($temp_ref_gene_id){
-			print $temp_fh " ref_gene_id \"$temp_ref_gene_id\"\;";
-		}
-		if($temp_ref_gene_name){
-			print $temp_fh " ref_gene_name \"$temp_ref_gene_name\"\;";
-		}
-		elsif($temp_transcript_ref->{'ref_gene_name'}){
-			print $temp_fh " ref_gene_name \"$temp_transcript_ref->{'ref_gene_name'}\"\;";
-		}
-		if($temp_ref_gene_type){
-			print $temp_fh " ref_gene_type \"$temp_ref_gene_type\"\;";
-		}
-		elsif($temp_transcript_ref->{'ref_gene_type'}){
-			print $temp_fh " ref_gene_type \"$temp_transcript_ref->{'ref_gene_type'}\"\;";
-		}
 		if($temp_tag =~ /novel_gene/){
 			print $temp_fh " tag \"novel_gene\"\;";
 		}
@@ -1303,7 +1329,7 @@ sub get_5p{
 
 #Evaluate transcript mapping
 sub evaluate_transcript{
-	my ($temp_pass, $temp_monoexonic_gene_type_ref, $temp_map_ref, $temp_loci_ref, $temp_ref_transcript_ref, $temp_query_transcript_ref, $temp_ref_gene_ref, $temp_query_annotated_gtf, $temp_query_fusion_gtf, $temp_query_novel_ref_gtf, $temp_query_novel_gtf) = @_;
+	my ($temp_pass, $temp_monoexonic_gene_type_ref, $temp_map_ref, $temp_loci_ref, $temp_ref_transcript_ref, $temp_query_transcript_ref, $temp_ref_gene_ref, $temp_query_annotated_gtf, $temp_query_fusion_gtf, $temp_query_novel_ref_gtf, $temp_query_novel_gtf, $temp_meta_ref) = @_;
 	open(my $temp_annotated_fh, ">> $temp_query_annotated_gtf") or die "Cannot open $temp_query_annotated_gtf!\n";
 	open(my $temp_fusion_fh, ">> $temp_query_fusion_gtf") or die "Cannot open $temp_query_fusion_gtf!\n";
 	open(my $temp_novel_ref_fh, ">> $temp_query_novel_ref_gtf") or die "Cannot open $temp_query_novel_ref_gtf!\n";
@@ -1430,8 +1456,9 @@ sub evaluate_transcript{
 					"", 
 					"", 
 					"", 
-					""
-				);
+					"", 
+			$temp_meta_ref
+		);
 			}
 			elsif($temp_known_flag == 1){
 				print_exon(
@@ -1447,8 +1474,9 @@ sub evaluate_transcript{
 					"", 
 					"", 
 					"", 
-					""
-				);
+					"", 
+			$temp_meta_ref
+		);
 			}
 			elsif($temp_map_ref->{$temp_query_transcript_id}{$temp_sorted_transcript_id[0]}{'partial'} == 1){
 				if($temp_ref_transcript_ref->{$temp_sorted_transcript_id[0]}{'novel_gene'} == 1){
@@ -1466,8 +1494,9 @@ sub evaluate_transcript{
 						"", 
 						"", 
 						"", 
-						"novel_gene"
-					);
+						"novel_gene", 
+			$temp_meta_ref
+		);
 				}
 				else{
 					my $temp_status;
@@ -1529,8 +1558,9 @@ sub evaluate_transcript{
 						"", 
 						"", 
 						"", 
-						""
-					);
+						"", 
+			$temp_meta_ref
+		);
 				}
 			}
 			elsif($temp_query_code =~ /1/){
@@ -1549,8 +1579,9 @@ sub evaluate_transcript{
 						"", 
 						"", 
 						"", 
-						"novel_gene"
-					);
+						"novel_gene", 
+			$temp_meta_ref
+		);
 				}
 				else{
 					#Novel isoform with novel transcript structure
@@ -1567,8 +1598,9 @@ sub evaluate_transcript{
 						"", 
 						"", 
 						"", 
-						""
-					);
+						"", 
+			$temp_meta_ref
+		);
 				}
 			}
 			else{
@@ -1586,8 +1618,9 @@ sub evaluate_transcript{
 					"", 
 					"", 
 					"", 
-					""
-				);
+					"", 
+			$temp_meta_ref
+		);
 			}
 		}
 		elsif(($temp_pass == 2) || ($temp_pass == 3)){
@@ -1608,8 +1641,9 @@ sub evaluate_transcript{
 						"", 
 						"", 
 						"", 
-						""
-					);
+						"", 
+			$temp_meta_ref
+		);
 				}
 				elsif($temp_ref_transcript_ref->{$temp_sorted_transcript_id[0]}{'novel_gene'} == 1){
 					#Isoforms of novel gene identified in the initial pass
@@ -1626,8 +1660,9 @@ sub evaluate_transcript{
 						"", 
 						"", 
 						"", 
-						"novel_gene"
-					);
+						"novel_gene", 
+			$temp_meta_ref
+		);
 				}
 				else{
 					#Novel isoform with novel transcript structure
@@ -1644,8 +1679,9 @@ sub evaluate_transcript{
 						"", 
 						"", 
 						"", 
-						""
-					);
+						"", 
+			$temp_meta_ref
+		);
 				}
 			}
 			else{
@@ -1663,8 +1699,9 @@ sub evaluate_transcript{
 					"", 
 					"", 
 					"", 
-					""
-				);
+					"", 
+			$temp_meta_ref
+		);
 			}
 		}
 		elsif($temp_pass == 4){
@@ -1683,8 +1720,9 @@ sub evaluate_transcript{
 					"", 
 					"", 
 					"", 
-					""
-				);
+					"", 
+			$temp_meta_ref
+		);
 			}
 			else{
 				#Isoform of novel gene
@@ -1700,8 +1738,9 @@ sub evaluate_transcript{
 					"", 
 					"", 
 					"", 
-					""
-				);
+					"", 
+			$temp_meta_ref
+		);
 			}
 		}
 		delete $temp_map_ref->{$temp_query_transcript_id};
@@ -1722,7 +1761,8 @@ sub evaluate_transcript{
 			"", 
 			"", 
 			"", 
-			""
+			"", 
+			$temp_meta_ref
 		);
 		delete $temp_query_transcript_ref->{$temp_query_transcript_id};
 	}
@@ -1776,7 +1816,7 @@ sub tss_dist{
 
 #Map query transcirpts to reference
 sub compare_tss{
-	my ($temp_monoexonic_gene_type_ref, $temp_max_p, $temp_loci_ref, $temp_ref_transcript_ref, $temp_query_transcript_ref, $temp_ref_gene_ref, $temp_ref_transcript_gtf, $temp_query_transcript_gtf, $temp_ref_transcript_tss_gtf, $temp_query_transcript_tss_gtf, $temp_query_annotated_gtf, $temp_query_novel_ref_gtf, $temp_query_novel_gtf, $temp_btp) = @_;
+	my ($temp_monoexonic_gene_type_ref, $temp_max_p, $temp_loci_ref, $temp_ref_transcript_ref, $temp_query_transcript_ref, $temp_ref_gene_ref, $temp_ref_transcript_gtf, $temp_query_transcript_gtf, $temp_ref_transcript_tss_gtf, $temp_query_transcript_tss_gtf, $temp_query_annotated_gtf, $temp_query_novel_ref_gtf, $temp_query_novel_gtf, $temp_btp, $temp_meta_ref) = @_;
 	print_transcript_tss(
 		"", 
 		"", 
@@ -1848,12 +1888,28 @@ sub compare_tss{
 					"", 
 					"", 
 					"", 
-					"novel_gene"
-				);
+					"novel_gene", 
+					$temp_meta_ref
+		);
 			}
 			else{
 				#Novel isoform with novel structure
-				print_exon($temp_annotated_fh, $temp_query_transcript_ref->{$temp_query_transcript_id}, $temp_query_transcript_id, $temp_ref_transcript_ref->{$temp_sorted_transcript_id[0]}{'gene_id'}, $temp_ref_transcript_ref->{$temp_sorted_transcript_id[0]}{'gene_name'}, $temp_ref_transcript_ref->{$temp_sorted_transcript_id[0]}{'gene_type'}, "novel_structure", $temp_query_transcript_ref->{$temp_query_transcript_id}{'gene_id'}, $temp_sorted_transcript_id[0], "", "", "", "");
+				print_exon(
+					$temp_annotated_fh, 
+					$temp_query_transcript_ref->{$temp_query_transcript_id}, 
+					$temp_query_transcript_id, 
+					$temp_ref_transcript_ref->{$temp_sorted_transcript_id[0]}{'gene_id'}, 
+					$temp_ref_transcript_ref->{$temp_sorted_transcript_id[0]}{'gene_name'}, 
+					$temp_ref_transcript_ref->{$temp_sorted_transcript_id[0]}{'gene_type'}, 
+					"novel_structure", 
+					$temp_query_transcript_ref->{$temp_query_transcript_id}{'gene_id'}, 
+					$temp_sorted_transcript_id[0], 
+					"", 
+					"", 
+					"", 
+					"", 
+					$temp_meta_ref
+		);
 			}
 		}
 		else{
@@ -1871,8 +1927,9 @@ sub compare_tss{
 				"", 
 				"", 
 				"", 
-				""
-			);
+				"", 
+				$temp_meta_ref
+		);
 		}
 		delete $temp_query_transcript_ref->{$temp_query_transcript_id};
 	}
@@ -1927,7 +1984,7 @@ sub cluster_transcript{
 
 #Re-cluster novel transcripts
 sub recluster_novel{
-	my ($temp_novel_cluster_count_ref, $temp_in_gtf, $temp_out_gtf) = @_;
+	my ($temp_novel_cluster_count_ref, $temp_in_gtf, $temp_out_gtf, $temp_meta_ref) = @_;
 	#Read gtf of novel transcripts. Cannot use the general function read_gtf for this.
 	open(my $temp_fh, $temp_in_gtf) or die "Cannot open $temp_in_gtf!\n";
 	my %temp_transcript = ();
@@ -1990,6 +2047,9 @@ sub recluster_novel{
 		foreach my $temp_cluster_ref (@temp_transcript_cluster){
 			foreach my $temp_transcript_id (@{$temp_cluster_ref->[2]}){
 				my $temp_novel_gene_id = "${temp_gene_id}_$temp_novel_cluster_count_ref->{$temp_gene_id}";
+				if($temp_meta_ref){
+					$temp_meta_ref->{$temp_transcript_id}{'asm_gene_id'} = $temp_transcript{$temp_transcript_id}{'asm_gene_id'};
+				}
 				foreach my $temp_line (@{$temp_transcript{$temp_transcript_id}{'original'}}){
 					if($temp_line =~ /^(gene_id \"[^\"]+\")\;/){
 						my $temp_gene_id = $1;
@@ -2002,10 +2062,10 @@ sub recluster_novel{
 						$temp_line =~ s/$temp_gene_id/ gene_id \"$temp_novel_gene_id\"/;
 					}
 					else{
-						print STDERR "<ERROR> Cannot find query gene ID at line:\n$temp_line\n";	
+						print STDERR "<ERROR> Cannot find query gene ID at line:\n$temp_line\n";
 						exit;
 					}
-					print $temp_fh "$temp_line asm_gene_id \"$temp_transcript{$temp_transcript_id}{'asm_gene_id'}\"\;\n";
+					print $temp_fh "$temp_line\n";
 				}
 			}
 			$temp_novel_cluster_count_ref->{$temp_gene_id}++;
@@ -2122,7 +2182,7 @@ sub print_intron{
 
 #Classify novel loci
 sub classify_novel{
-	my ($temp_monoexonic_gene_type_ref, $temp_ref_gene_type_ref, $temp_max_bd, $temp_ref_transcript_ref, $temp_query_transcript_ref, $temp_ref_gene_ref, $temp_query_gene_ref, $temp_ref_gtf, $temp_query_gtf, $temp_ref_gene_gtf, $temp_ref_gene_tss_gtf, $temp_ref_transcript_gtf, $temp_ref_transcript_tss_gtf, $temp_ref_intron_gtf, $temp_query_gene_gtf, $temp_query_gene_tss_gtf, $temp_query_transcript_gtf, $temp_query_transcript_tss_gtf, $temp_query_classified_gtf, $temp_btp) = @_;
+	my ($temp_monoexonic_gene_type_ref, $temp_ref_gene_type_ref, $temp_max_bd, $temp_ref_transcript_ref, $temp_query_transcript_ref, $temp_ref_gene_ref, $temp_query_gene_ref, $temp_ref_gtf, $temp_query_gtf, $temp_ref_gene_gtf, $temp_ref_gene_tss_gtf, $temp_ref_transcript_gtf, $temp_ref_transcript_tss_gtf, $temp_ref_intron_gtf, $temp_query_gene_gtf, $temp_query_gene_tss_gtf, $temp_query_transcript_gtf, $temp_query_transcript_tss_gtf, $temp_query_classified_gtf, $temp_btp, $temp_meta_ref) = @_;
 	#Create gene annotation for the reference
 	print_gene_tss(
 		$temp_monoexonic_gene_type_ref, 
@@ -2533,7 +2593,8 @@ sub classify_novel{
 			$temp_ref_gene_id, 
 			$temp_ref_gene_name, 
 			$temp_ref_gene_type, 
-			""
+			"", 
+			$temp_meta_ref
 		);
 	}
 	close $temp_fh;
@@ -2542,7 +2603,7 @@ sub classify_novel{
 }
 
 sub rearrange_fusion{
-	my ($temp_monoexonic_gene_type_ref, $temp_map_ref,$temp_ref_transcript_ref, $temp_ref_gene_ref, $temp_query_transcript_ref, $temp_query_gtf) = @_;
+	my ($temp_monoexonic_gene_type_ref, $temp_map_ref,$temp_ref_transcript_ref, $temp_ref_gene_ref, $temp_query_transcript_ref, $temp_query_gtf, $temp_meta_ref) = @_;
 	open(my $temp_fh, "> $temp_query_gtf") or die "Cannot open $temp_query_gtf!\n";
 	my %temp_gene_5p = ();
 	foreach my $temp_query_transcript_id (keys %$temp_map_ref){
@@ -2629,7 +2690,8 @@ sub rearrange_fusion{
 			"", 
 			"", 
 			"", 
-			""
+			"", 
+			$temp_meta_ref
 		); 
 	}
 	close $temp_fh;
@@ -2639,7 +2701,7 @@ sub rearrange_fusion{
 
 #Print missing exons in the reference
 sub print_missing{
-	my ($temp_ref_transcript_ref, $temp_missing) = @_;
+	my ($temp_ref_transcript_ref, $temp_missing, $temp_meta_ref) = @_;
 	open(my $temp_fh, "> $temp_missing") or die "Cannot create $temp_missing!\n";
 	foreach my $temp_ref_transcript_id (keys %$temp_ref_transcript_ref){
 		if(($temp_ref_transcript_ref->{$temp_ref_transcript_id}{'hit'} == 0) && ($temp_ref_transcript_ref->{$temp_ref_transcript_id}{'novel_gene'} == 0)){
@@ -2656,14 +2718,13 @@ sub print_missing{
 				"", 
 				"", 
 				"", 
-				""
-			);
+				"", 
+				$temp_meta_ref
+		);
 		}
 	}
 	close $temp_fh;
 }
-
-
 
 
 
