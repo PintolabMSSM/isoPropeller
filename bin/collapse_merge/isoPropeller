@@ -15,6 +15,7 @@ Change log:
 	v1.8.3	2024-09	Fixed the bed file coordinate issue. Added an option to rescue predicted intrapriming reads ending in annotated exons.
 	v1.9	2026-06	Replaced intron GTF input to the STAR SJ.out.tab format and used the sum of n_uniquely_mapped and n_multi_mapped as coverage.
 	v1.10	2026-10	Replaced the ithreads-based scheduler with a fork()-based worker pool. Fixed the chromosome split issue.
+	v1.10.1	2026-11	Fixed an order issue in tied splice junction selection for correction in find_nearest().
 =cut
 
 use strict;
@@ -30,7 +31,7 @@ $| = 1;
 
 my $total_start_time = Benchmark->new;
 
-my $version = "v1.10";
+my $version = "v1.10.1";
 
 my ($bam, $out, $prefix, $mapq, $stp, $num_thread, $junc, $min_junc_dist, $junc_dist, $end_dist, $polya, $genome, $window, $frac_a_min, $length_a_min, $fprime, $fprime_dist, $ipr, $chr_list, $help) = ("", "", "ISOP", 0, "samtools", 1, "", 10, 0, 0, "", "", 20, 0.6, 6, "", 100, "", "", 0);
 
@@ -1345,10 +1346,12 @@ sub find_nearest{
 	if($temp_num_db > $temp_cutoff){
 		SEARCH:for(my $temp_dist = 0; $temp_dist < $temp_min_junc_dist; $temp_dist++){
 			for(my $temp_offset = 0; $temp_offset <= $temp_dist; $temp_offset++){
-				my %temp_left = (($temp_query_ref->[0] - $temp_offset), 1, ($temp_query_ref->[0] + $temp_offset), 1);
-				my %temp_right = (($temp_query_ref->[1] - ($temp_dist - $temp_offset)), 1, ($temp_query_ref->[1] + ($temp_dist - $temp_offset)), 1);
-				foreach my $temp_left (keys %temp_left){
-					foreach my $temp_right (keys %temp_right){
+				my @temp_left = ($temp_query_ref->[0] - $temp_offset);
+				push(@temp_left, $temp_query_ref->[0] + $temp_offset) if $temp_offset != 0;
+				my @temp_right = ($temp_query_ref->[1] - ($temp_dist - $temp_offset));
+				push(@temp_right, $temp_query_ref->[1] + ($temp_dist - $temp_offset)) if ($temp_dist - $temp_offset) != 0;
+				foreach my $temp_left (@temp_left){
+					foreach my $temp_right (@temp_right){
 						if(exists $temp_db_hash_ref->{$temp_left}{$temp_right}){
 							if(($temp_db_hash_ref->{$temp_left}{$temp_right}[4] + $temp_db_hash_ref->{$temp_left}{$temp_right}[5]) > $temp_coverage){
 								@temp_nearest_splice_site = ($temp_left, $temp_right, $temp_db_hash_ref->{$temp_left}{$temp_right}[4]);
