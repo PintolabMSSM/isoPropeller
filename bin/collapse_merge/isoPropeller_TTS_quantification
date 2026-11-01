@@ -4,6 +4,7 @@ Author: ALin
 Purpose: To identify TTS clusters based on pooled read depth based on alist of isoPropeller's output file *_end_dist.txt.
 Change log:
 	v1.2	2026-10	Replaced `threads` with fork()+waitpid worker processes. Added -b for memory efficient batching. Added per-sample depth vectors. Removed the separate %tts_pool hash.
+	v1.2.1	Fixed a crash issue in batching.
 =cut
 
 use strict;
@@ -25,7 +26,7 @@ unless(-e $modal_meanshift){
 
 my $total_start_time = Benchmark->new;
 
-my $version = "v1.2";
+my $version = "v1.2.1";
 
 my ($in, $out, $id, $bandwidth, $epsilon, $num_thread, $num_batch_opt, $help) = ("", "", "", 1000, 1, 1, 0, 0);
 
@@ -100,12 +101,15 @@ my $start_time = Benchmark->new;
 $date = `date $date_format`;
 chomp $date;
 print "[$date]\tStarting preprocessing...\n";
-my $sample_ref = split_batch($dir, $in, $id, $num_batch);
+my ($sample_ref, $num_batch_actual) = split_batch($dir, $in, $id, $num_batch);
 my $finish_time = Benchmark->new;
 my $time_spent = timediff($finish_time, $start_time);
 $date = `date $date_format`;
 chomp $date;
 print "[$date]\tUsed ". timestr($time_spent) . " for preprocessing\n";
+if($num_batch_actual != $num_batch){
+	print "[$date]\tNote: requested $num_batch batches, but only $num_batch_actual transcript(s)/batch(es) are needed (fewer transcripts than requested batches); using $num_batch_actual.\n";
+}
 
 my %running_pid_to_batch = ();
 my $next_batch = 1;
@@ -130,7 +134,7 @@ sub reap_one{
 	return 1;
 }
 
-while($next_batch <= $num_batch){
+while($next_batch <= $num_batch_actual){
 	while(scalar(keys %running_pid_to_batch) >= $num_thread){
 		reap_one($date_format, \%running_pid_to_batch, \%failed);
 	}
@@ -256,9 +260,21 @@ sub split_batch{
 		}
 	}
 	close $temp_fh;
-	my $temp_batch_size = int((keys %temp_transcript) / $temp_num_batch) + 1;
-	if(((keys %temp_transcript) / $temp_num_batch) == 1){
-		$temp_batch_size = 1;
+	my $temp_total = scalar(keys %temp_transcript);
+	my $temp_num_batch_actual = $temp_num_batch;
+	if($temp_num_batch_actual > $temp_total){
+		$temp_num_batch_actual = $temp_total;
+	}
+	if($temp_num_batch_actual < 1){
+		$temp_num_batch_actual = 1; #Guard $temp_total == 0; the per-item loop below just never runs.
+	}
+	my $temp_base_size = int($temp_total / $temp_num_batch_actual);
+	my $temp_remainder = $temp_total % $temp_num_batch_actual;
+	
+	my @temp_batch_cum = (0);
+	for(my $temp_bi = 1; $temp_bi <= $temp_num_batch_actual; $temp_bi++){
+		my $temp_this_size = $temp_base_size + (($temp_bi <= $temp_remainder) ? 1 : 0);
+		push(@temp_batch_cum, $temp_batch_cum[-1] + $temp_this_size);
 	}
 	my ($temp_count, $temp_batch_count) = (0, 1);
 	open($temp_fh, "> ${temp_dir}/batch_${temp_batch_count}_id.txt") or die "<ERROR> Cannot create ${temp_dir}/batch_${temp_batch_count}_id.txt!\n";
@@ -266,7 +282,7 @@ sub split_batch{
 	print $temp_fh "$temp_header_line\n";
 	foreach my $temp_transcript_id (keys %temp_transcript){
 		$temp_count++;
-		if($temp_count > ($temp_batch_size * $temp_batch_count)){
+		if($temp_count > $temp_batch_cum[$temp_batch_count]){
 			close $temp_fh;
 			$temp_batch_count++;
 			open($temp_fh, "> ${temp_dir}/batch_${temp_batch_count}_id.txt") or die "<ERROR> Cannot create ${temp_dir}/batch_${temp_batch_count}_id.txt!\n";;
@@ -297,7 +313,7 @@ sub split_batch{
 		close $temp_batch_fh{$temp_batch};
 	}
 
-	return \@temp_sample;
+	return (\@temp_sample, $temp_num_batch_actual);
 }
 
 #Parse the file list
