@@ -30,7 +30,7 @@ unless(-e $modal_meanshift){
 
 my $total_start_time = Benchmark->new;
 
-my $version = "v1.6";
+my $version = "v1.6.1";
 
 my ($in, $out, $id, $bandwidth, $epsilon, $num_thread, $num_batch_opt, $help) = ("", "", "", 100, 1, 1, 0, 0);
 
