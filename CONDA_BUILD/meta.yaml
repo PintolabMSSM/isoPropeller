@@ -1,5 +1,5 @@
 {% set name                = "isoPropeller" %}
-{% set version             = "1.9.4" %}
+{% set version             = "1.10.1" %}
 
 package:
   name: "{{ name|lower }}"
@@ -7,6 +7,7 @@ package:
 
 source:
   git_url: git@github.com:PintolabMSSM/{{ name }}.git
+  git_rev: dev
 
 build:
   number: 1
