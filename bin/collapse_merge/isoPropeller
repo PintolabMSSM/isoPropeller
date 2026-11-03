@@ -16,6 +16,7 @@ Change log:
 	v1.9	2026-06	Replaced intron GTF input to the STAR SJ.out.tab format and used the sum of n_uniquely_mapped and n_multi_mapped as coverage.
 	v1.10	2026-10	Replaced the ithreads-based scheduler with a fork()-based worker pool. Fixed the chromosome split issue.
 	v1.10.1	2026-11	Fixed an order issue in tied splice junction selection for correction in find_nearest().
+	v1.11	2026-11	TSS/TTS information would be collected only when -e enabled. Implemented active window streaming for merging reads in loci. Improved memory efficiency in read merging. Replaced -x with -j. Added a new -x for de novo mode.
 =cut
 
 use strict;
@@ -31,9 +32,11 @@ $| = 1;
 
 my $total_start_time = Benchmark->new;
 
-my $version = "v1.10.1";
+my $version = "v1.11";
 
-my ($bam, $out, $prefix, $mapq, $stp, $num_thread, $junc, $min_junc_dist, $junc_dist, $end_dist, $polya, $genome, $window, $frac_a_min, $length_a_min, $fprime, $fprime_dist, $ipr, $chr_list, $help) = ("", "", "ISOP", 0, "samtools", 1, "", 10, 0, 0, "", "", 20, 0.6, 6, "", 100, "", "", 0);
+my $ISOP_EMPTY_ENDS_HREF = {};
+
+my ($bam, $out, $prefix, $mapq, $stp, $num_thread, $junc, $denovo, $min_junc_dist, $junc_dist, $end_dist, $polya, $genome, $window, $frac_a_min, $length_a_min, $fprime, $fprime_dist, $ipr, $chr_list, $help) = ("", "", "ISOP", 0, "samtools", 1, "", 0, 10, 0, 0, "", "", 20, 0.6, 6, "", 100, "", "", 0);
 
 my $usage="Usage: perl isoPropeller_${version}.pl
 	-i <String> Input BAM file (Required)
@@ -42,7 +45,17 @@ my $usage="Usage: perl isoPropeller_${version}.pl
 	-q <Integer> Minimal mapping quality (Inclusive; default: $mapq)
 	-s <String> The path to samtools (samtools >= 1.11, default: \${PATH}/samtools)
 	-t <Integer> The number of threads to use (Default: $num_thread)
-	-x <String> The SJ.out.tab file specifying splice junctions used for correction. An optional attribute, depth, can be included.
+	-j <String> The SJ.out.tab file specifying splice junctions used for correction.
+	-x <Boolean> De novo mode (Default: false). Normally used together with -j: a transcript's
+	   individual splice junctions are still corrected against -j wherever a near-enough reference
+	   junction exists, but a junction with no near-enough reference match (or whose only nearby
+	   match would violate this transcript's own exon ordering) is kept as originally sequenced
+	   instead of discarding the whole transcript -- on the assumption that a reference junction set
+	   is never complete, and a consistently-supported novel junction shouldn't be thrown away just
+	   because it isn't yet annotated. Reads with such a transcript are counted toward both \"kept\"
+	   and \"uncorrected\" in \${out}_stat.txt (kept, because the transcript is retained in the
+	   output; uncorrected, as a QC signal of how much output depth relies on an unverified
+	   junction). Has no effect unless -j is also set.
 	-m <Int> The minimal distance for splice junction correction (Default: $min_junc_dist, empirical)
 	-d <Boolean> Output the distance of splice junction between the prediction and the reference (Default: false)
 	-e <Boolean> Output the distribution of the 5' and 3' end position for each transcript (Default: false)
@@ -65,7 +78,8 @@ GetOptions(
 	'q=i'	=>	\$mapq,
 	's=s'	=>	\$stp,
 	't=i'	=>	\$num_thread,
-	'x=s'	=>	\$junc,
+	'j=s'	=>	\$junc,
+	'x!'	=>	\$denovo,
 	'm=i'	=>	\$min_junc_dist,
 	'd!'	=>	\$junc_dist,
 	'e!'	=>	\$end_dist,
@@ -80,6 +94,11 @@ GetOptions(
 	'c=s'	=>	\$chr_list,
 	'h!'	=>	\$help
 );
+
+if(@ARGV){
+	print STDERR "<ERROR> Unrecognized argument(s): @ARGV\nIf you are trying to specify the reference splice-junction file, use -j (changed from -x in v1.11 -- -x is now the de-novo-mode boolean).\n$usage";
+	exit;
+}
 
 if($help){
         print "$usage";
@@ -119,13 +138,20 @@ print $log_fh "[$date]\tperl isoPropeller_${version}.pl -i $bam -o $out -p $pref
 print $out_fh "#perl isoPropeller_${version}.pl -i $bam -p $prefix -o $out -q $mapq -s $stp -t $num_thread";
 if($junc){
 	if(-e $junc){
-		print $log_fh " -x $junc -m $min_junc_dist";
-		print $out_fh " -x $junc -m $min_junc_dist";
+		print $log_fh " -j $junc -m $min_junc_dist";
+		print $out_fh " -j $junc -m $min_junc_dist";
+		if($denovo){
+			print $log_fh " -x";
+			print $out_fh " -x";
+		}
 	}
 	else{
 		print STDERR "$junc does not exists!\n$usage";
 		exit;
 	}
+}
+elsif($denovo){
+	print STDERR "<WARNING> -x (de novo mode) has no effect without -j; ignoring -x.\n";
 }
 if($junc_dist){
 	print $log_fh " -d";
@@ -305,7 +331,7 @@ sub reap_one{
 		return 1;
 	}
 	my $temp_result_ref = retrieve($temp_stat_file);
-	@{$read{$temp_chr}} = ($temp_result_ref->[0], $temp_result_ref->[1]);
+	@{$read{$temp_chr}} = ($temp_result_ref->[0], $temp_result_ref->[1], $temp_result_ref->[2]);
 	print $temp_log_fh "[$temp_date]\tJoined for $temp_chr!\n";
 
 	return 1;
@@ -320,7 +346,7 @@ while($chr_pos < @$chr_ref || %running_pid_to_chr){
 		}
 		if($pid == 0){
 			#Child
-			worker($log_fh, $chr, $dir, $mapq, $prefix, $min_junc_dist, $junc, $junc_dist, $end_dist, $polya, $genome, $window, $frac_a_min, $length_a_min, $fprime, $fprime_dist, $ipr, $stp);
+			worker($log_fh, $chr, $dir, $mapq, $prefix, $min_junc_dist, $junc, $denovo, $junc_dist, $end_dist, $polya, $genome, $window, $frac_a_min, $length_a_min, $fprime, $fprime_dist, $ipr, $stp);
 			POSIX::_exit(0);
 		}
 		else{
@@ -384,7 +410,7 @@ chomp $date;
 print $log_fh "[$date]\tTotal time used: ". timestr($total_time_spent) . "\n";
 
 sub worker{
-	my ($temp_log_fh, $temp_chr, $temp_dir, $temp_mapq, $temp_prefix, $temp_min_junc_dist, $temp_junc, $temp_junc_dist, $temp_end_dist, $temp_polya, $temp_genome, $temp_window, $temp_frac_a_min, $temp_length_a_min, $temp_fprime, $temp_fprime_dist, $temp_ipr, $temp_stp) = @_;
+	my ($temp_log_fh, $temp_chr, $temp_dir, $temp_mapq, $temp_prefix, $temp_min_junc_dist, $temp_junc, $temp_denovo, $temp_junc_dist, $temp_end_dist, $temp_polya, $temp_genome, $temp_window, $temp_frac_a_min, $temp_length_a_min, $temp_fprime, $temp_fprime_dist, $temp_ipr, $temp_stp) = @_;
 	my $temp_date_format = "+%F-%T.%3N";
 	my $temp_date = `date $temp_date_format`;
 	chomp $temp_date;
@@ -398,9 +424,12 @@ sub worker{
 	my %temp_tss = ();
 	my %temp_ip = ();
 	my $temp_num_filtered_junc_dist = 0;
+	my $temp_num_denovo_dist = 0;
 	my %temp_junc_dist;
 	my %temp_loci = ();
 	my %temp_read = ();
+	my %temp_open_locus = ();
+	my $temp_last_pos = undef;
 
 	if($temp_junc){
 		read_ref_eej("${temp_dir}/${temp_chr}_SJ.out.tab", \%temp_ref_eej_array, \%temp_ref_eej_hash);
@@ -437,27 +466,27 @@ sub worker{
 			next;
 		}
 		#Parse the read structure
-		my ($temp_strand, $temp_leftmost, $temp_rightmost, $temp_eej, $temp_ends_ref, $temp_polya_flag_ref) = parse_bam_line($temp_chr, \@temp_line, \%temp_polya, \%temp_ref_eej_hash, $temp_seq_obj, \%temp_tss, \%temp_ip, $temp_window, $temp_frac_a_min, $temp_length_a_min, $temp_fprime);
+		my ($temp_strand, $temp_leftmost, $temp_rightmost, $temp_eej, $temp_ends_ref, $temp_polya_flag_ref) = parse_bam_line($temp_chr, \@temp_line, \%temp_polya, \%temp_ref_eej_hash, $temp_seq_obj, \%temp_tss, \%temp_ip, $temp_window, $temp_frac_a_min, $temp_length_a_min, $temp_fprime, $temp_end_dist);
 		if(($temp_strand eq 'artifact') || ($temp_strand eq 'intrapriming') || ($temp_strand eq 'no_5p')){
 			filter_bam_line(\%temp_read, \@temp_line, $temp_mapq, $temp_strand);
 			next;
 		}
 		my $temp_depth = 1;
-		add_locus(\%temp_loci, $temp_strand, $temp_leftmost, $temp_rightmost, $temp_eej, $temp_depth, $temp_ends_ref, $temp_polya_flag_ref);
+		stream_add_locus(\%temp_loci, \%temp_open_locus, \$temp_last_pos, $temp_strand, $temp_leftmost, $temp_rightmost, $temp_eej, $temp_depth, $temp_ends_ref, $temp_polya_flag_ref);
 		#print "Added $temp_line[0]\n";
 	}
 	close $temp_fh;
+	flush_open_loci(\%temp_loci, \%temp_open_locus);
 	$temp_date = `date $temp_date_format`;
 	chomp $temp_date;
 	print $temp_log_fh "[$temp_date]\tProcessed bam file for $temp_chr!\n";
 
-	merge_loci(\%temp_loci);
 	$temp_date = `date $temp_date_format`;
 	chomp $temp_date;
 	print $temp_log_fh "[$temp_date]\tMerged loci for $temp_chr!\n";
 
 	if($temp_junc){
-		($temp_num_filtered_junc_dist) = correct_eej(\%temp_loci, \%temp_ref_eej_array, \%temp_ref_eej_hash, $temp_min_junc_dist, \%temp_junc_dist);
+		($temp_num_filtered_junc_dist, $temp_num_denovo_dist) = correct_eej(\%temp_loci, \%temp_ref_eej_array, \%temp_ref_eej_hash, $temp_min_junc_dist, \%temp_junc_dist, $temp_denovo);
 		break_loci(\%temp_loci);
 		merge_loci(\%temp_loci);
 	}
@@ -475,11 +504,7 @@ sub worker{
 	#print "Correction failed: $temp_num_filtered_junc_dist\n";
 	#print "Returning %temp_read $temp_chr $temp_num_filtered_junc_dist\n";
 
-	#fork()ed children can't hand a Perl data structure back to the parent via a return
-	#value the way threads->join() could; serialize the stats the parent needs for
-	#print_stat() to a small per-chromosome file instead, which the parent retrieves
-	#after reaping this child (see reap_one()).
-	my @temp_result = (\%temp_read, $temp_num_filtered_junc_dist);
+	my @temp_result = (\%temp_read, $temp_num_filtered_junc_dist, $temp_num_denovo_dist);
 	nstore(\@temp_result, "${temp_dir}/${temp_chr}_stat.dat");
 
 	my $temp_finish_time = Benchmark->new;
@@ -513,7 +538,7 @@ sub split_bam{
 		$temp_chr =~ s/\r//;
 		unless(exists $temp_chr{$temp_chr}){
 			$temp_chr{$temp_chr} = $temp_count;
-			open($temp_fh[$temp_count], "| $temp_stp view -bS - > ${temp_dir}/${temp_chr}.bam")
+			open($temp_fh[$temp_count], "| $temp_stp sort -O bam -o ${temp_dir}/${temp_chr}.bam -")
 		}
 		$temp_count++;
 		push(@temp_chr, $temp_chr);
@@ -539,11 +564,6 @@ sub split_bam{
 	return (\@temp_chr, $temp_num_unmapped);
 }
 
-#Split the reference eejs of different chromosomes into different files.
-#Replaces a previous per-chromosome `system("grep \"^$chr\"$'\t' ...")`: that relied on
-#bash/ksh ANSI-C quoting ($'\t') for a literal tab, which a non-bash /bin/sh (e.g. dash)
-#does not interpret, so the grep silently matched nothing there. This native single pass
-#also turns an O(chromosomes x file size) rescan into a single O(file size) pass.
 sub split_ref_eej{
 	my ($temp_chr_ref, $temp_dir, $temp_junc) = @_;
 	my %temp_valid_chr = map { ($_, 1) } @$temp_chr_ref;
@@ -564,9 +584,6 @@ sub split_ref_eej{
 	foreach my $temp_chr (keys %temp_out_fh){
 		close $temp_out_fh{$temp_chr};
 	}
-	#read_ref_eej() is called unconditionally by every worker when -x is given, so every
-	#known chromosome needs a file even if nothing matched it (matching the original,
-	#where `grep ... > file` always creates the file via the redirect regardless of hits).
 	foreach my $temp_chr (@$temp_chr_ref){
 		unless(exists $temp_out_fh{$temp_chr}){
 			open(my $temp_ofh, "> ${temp_dir}/${temp_chr}_SJ.out.tab") or die "<ERROR> Cannot create ${temp_dir}/${temp_chr}_SJ.out.tab!\n";
@@ -578,11 +595,6 @@ sub split_ref_eej{
 }
 
 #Split the poly-A result from nanopolish polya of different chromosomes into different files.
-#Replaces per-chromosome `system("grep $'\t'\"$chr\"$'\t' ...")` (same dash-breaking ANSI-C
-#quoting bug as above). That pattern required $chr to exactly fill an INTERIOR
-#tab-delimited field (not the first or last column, since those lack a flanking tab on one
-#side) -- reproduced here by checking interior fields directly instead of a whole-line
-#regex, which is both correct and avoids rescanning the file once per chromosome.
 sub split_polya{
 	my ($temp_chr_ref, $temp_dir, $temp_polya) = @_;
 	my %temp_valid_chr = map { ($_, 1) } @$temp_chr_ref;
@@ -647,7 +659,6 @@ sub split_genome{
 }
 
 #Split the region file, including bed and gtf, of different chromosomes into different files.
-#Same dash/bash ANSI-C quoting bug as split_ref_eej, same native single-pass fix.
 sub split_region{
 	my ($temp_chr_ref, $temp_dir, $temp_bed, $temp_type, $temp_format) = @_;
 	my %temp_type = (fprime => 1, ipr => 1);
@@ -677,8 +688,6 @@ sub split_region{
 	foreach my $temp_chr (keys %temp_out_fh){
 		close $temp_out_fh{$temp_chr};
 	}
-	#read_five_prime()/read_ip_rescue() are called unconditionally by every worker when
-	#-f/-l is given, so every known chromosome needs a file even if nothing matched it.
 	foreach my $temp_chr (@$temp_chr_ref){
 		unless(exists $temp_out_fh{$temp_chr}){
 			open(my $temp_ofh, "> ${temp_dir}/${temp_chr}_${temp_type}.${temp_format}") or die "<ERROR> Cannot create ${temp_dir}/${temp_chr}_${temp_type}.${temp_format}!\n";
@@ -695,6 +704,7 @@ sub print_stat{
 	open($temp_fh, "> $temp_out") or die "<ERROR> Cannot create $temp_out!\n";
 	my %temp_all_read = ();
 	my $temp_uncorrected = 0;
+	my $temp_denovo = 0;
 	print $temp_fh "chr";
 	foreach my $temp_type ('primary', 'kept', 'filtered', 'unmapped', 'low_quality', 'failed', 'duplicated', 'secondary', 'supplementary', 'artifact', 'intrapriming', 'no_5p', 'uncorrected'){
 		%{$temp_all_read{$temp_type}} = ();
@@ -737,7 +747,9 @@ sub print_stat{
 			}
 		}
 		$temp_uncorrected += $temp_read_ref->{$temp_chr}[1];
-		print $temp_fh "\t$temp_read_ref->{$temp_chr}->[1]\n";
+		$temp_denovo += $temp_read_ref->{$temp_chr}[2];
+		my $temp_chr_uncorrected = $temp_read_ref->{$temp_chr}[1] + $temp_read_ref->{$temp_chr}[2];
+		print $temp_fh "\t$temp_chr_uncorrected\n";
 	}
 
 	print $temp_fh "Total";
@@ -754,7 +766,7 @@ sub print_stat{
 		}
 		print $temp_fh "\t$temp_count";
 	}
-	print $temp_fh "\t$temp_uncorrected\n";
+	print $temp_fh "\t" . ($temp_uncorrected + $temp_denovo) . "\n";
 	close $temp_fh;
 
 	return 1;
@@ -1085,7 +1097,7 @@ sub five_prime_support{
 
 #Parse a single line of the bam file and return the strand, leftmost position, rightmost position and exon-exon junction string (for multi-exon transcript only).
 sub parse_bam_line{
-	my ($temp_chr, $temp_line_ref, $temp_polya_ref, $temp_ref_eej_hash_ref, $temp_seq_obj, $temp_tss_ref, $temp_ip_ref, $temp_window, $temp_frac_a_min, $temp_length_a_min, $temp_fprime) = @_;
+	my ($temp_chr, $temp_line_ref, $temp_polya_ref, $temp_ref_eej_hash_ref, $temp_seq_obj, $temp_tss_ref, $temp_ip_ref, $temp_window, $temp_frac_a_min, $temp_length_a_min, $temp_fprime, $temp_end_dist) = @_;
 	my $temp_cigar = $temp_line_ref->[5];
 	#print "$temp_cigar\n";
 	my $temp_strand;
@@ -1099,7 +1111,6 @@ sub parse_bam_line{
         my $temp_leftmost = $temp_line_ref->[3];
 	my $temp_rightmost = $temp_line_ref->[3] - 1;
 	my $temp_cur_exon_left = $temp_line_ref->[3];
-	my %temp_ends = ();
 	my %temp_polya_flag = ();
 
 	if(exists $temp_polya_ref->{$temp_line_ref->[0]}){
@@ -1175,13 +1186,21 @@ sub parse_bam_line{
 			return 'no_5p';
 		}
 	}
-	unless(exists $temp_ends{"$temp_leftmost-$temp_rightmost"}){
-		$temp_ends{"$temp_leftmost-$temp_rightmost"} = 0;
+	my $temp_ends_ref;
+	if($temp_end_dist){
+		my %temp_ends = ();
+		unless(exists $temp_ends{"$temp_leftmost-$temp_rightmost"}){
+			$temp_ends{"$temp_leftmost-$temp_rightmost"} = 0;
+		}
+		$temp_ends{"$temp_leftmost-$temp_rightmost"}++;
+		$temp_ends_ref = \%temp_ends;
 	}
-	$temp_ends{"$temp_leftmost-$temp_rightmost"}++;
+	else{
+		$temp_ends_ref = $ISOP_EMPTY_ENDS_HREF;
+	}
 	#print "$temp_line_ref->[0]\t$temp_strand\t$temp_leftmost\t$temp_rightmost\t$temp_eej\n";
 
-	return ($temp_strand, $temp_leftmost, $temp_rightmost, $temp_eej, \%temp_ends, \%temp_polya_flag);
+	return ($temp_strand, $temp_leftmost, $temp_rightmost, $temp_eej, $temp_ends_ref, \%temp_polya_flag);
 }
 
 #Add a loci to the loci hash as in the first argument
@@ -1204,6 +1223,78 @@ sub add_locus{
 	#foreach my $i (keys %{$temp_locus[2]}){
 		#print "$i\t$temp_locus[2]{$i}\n";
 	#}
+
+	return 1;
+}
+
+sub stream_add_locus{
+	my ($temp_loci_ref, $temp_open_ref, $temp_last_pos_ref, $temp_strand, $temp_leftmost, $temp_rightmost, $temp_eej, $temp_depth, $temp_ends_ref, $temp_polya_flag_ref) = @_;
+
+	if(defined $$temp_last_pos_ref && ($temp_leftmost < $$temp_last_pos_ref)){
+		die "<ERROR> Input BAM is not coordinate-sorted (encountered leftmost position $temp_leftmost after $$temp_last_pos_ref) -- re-sort and re-index it, e.g. 'samtools sort' followed by 'samtools index', before running isoPropeller.\n";
+	}
+	$$temp_last_pos_ref = $temp_leftmost;
+
+	unless(exists $temp_loci_ref->{$temp_strand}){
+		@{$temp_loci_ref->{$temp_strand}} = ();
+	}
+
+	my $temp_locus = $temp_open_ref->{$temp_strand};
+	if((!defined $temp_locus) || ($temp_leftmost > $temp_locus->[1])){
+		if(defined $temp_locus){
+			push(@{$temp_loci_ref->{$temp_strand}}, $temp_locus);
+		}
+		my %temp_transcript = ();
+		@{$temp_transcript{$temp_eej}} = ([$temp_leftmost, $temp_rightmost, $temp_depth, $temp_ends_ref, $temp_polya_flag_ref]);
+		$temp_open_ref->{$temp_strand} = [$temp_leftmost, $temp_rightmost, \%temp_transcript];
+		return 1;
+	}
+
+	if($temp_rightmost > $temp_locus->[1]){
+		$temp_locus->[1] = $temp_rightmost;
+	}
+	my $temp_records = $temp_locus->[2]{$temp_eej};
+	unless(defined $temp_records){
+		$temp_records = [];
+		$temp_locus->[2]{$temp_eej} = $temp_records;
+	}
+	my $temp_last_record = $temp_records->[-1];
+	if(defined($temp_last_record) && ($temp_leftmost >= $temp_last_record->[0]) && ($temp_leftmost <= $temp_last_record->[1])){
+		if($temp_rightmost > $temp_last_record->[1]){
+			$temp_last_record->[1] = $temp_rightmost;
+		}
+		$temp_last_record->[2] += $temp_depth;
+		foreach my $temp_end_key (keys %{$temp_ends_ref}){
+			unless(exists $temp_last_record->[3]{$temp_end_key}){
+				$temp_last_record->[3]{$temp_end_key} = 0;
+			}
+			$temp_last_record->[3]{$temp_end_key} += $temp_ends_ref->{$temp_end_key};
+		}
+		foreach my $temp_polya_key (keys %{$temp_polya_flag_ref}){
+			unless(exists $temp_last_record->[4]{$temp_polya_key}){
+				$temp_last_record->[4]{$temp_polya_key} = 0;
+			}
+			$temp_last_record->[4]{$temp_polya_key} += $temp_polya_flag_ref->{$temp_polya_key};
+		}
+	}
+	else{
+		push(@{$temp_records}, [$temp_leftmost, $temp_rightmost, $temp_depth, $temp_ends_ref, $temp_polya_flag_ref]);
+	}
+
+	return 1;
+}
+
+sub flush_open_loci{
+	my ($temp_loci_ref, $temp_open_ref) = @_;
+	foreach my $temp_strand (keys %$temp_open_ref){
+		if(defined $temp_open_ref->{$temp_strand}){
+			unless(exists $temp_loci_ref->{$temp_strand}){
+				@{$temp_loci_ref->{$temp_strand}} = ();
+			}
+			push(@{$temp_loci_ref->{$temp_strand}}, $temp_open_ref->{$temp_strand});
+			$temp_open_ref->{$temp_strand} = undef;
+		}
+	}
 
 	return 1;
 }
@@ -1301,24 +1392,18 @@ sub merge_transcript{
 					$temp_last->[1] = $temp_cur->[1];
 				}
 				$temp_last->[2] += $temp_cur->[2];
-				my %temp_last_ends = %{$temp_last->[3]};
-				my %temp_cur_ends = %{$temp_cur->[3]};
-				foreach my $temp_ends (keys %temp_cur_ends){
-					unless(exists $temp_last_ends{$temp_ends}){
-						$temp_last_ends{$temp_ends} = 0;
+				foreach my $temp_ends (keys %{$temp_cur->[3]}){
+					unless(exists $temp_last->[3]{$temp_ends}){
+						$temp_last->[3]{$temp_ends} = 0;
 					}
-					$temp_last_ends{$temp_ends} += $temp_cur_ends{$temp_ends};
+					$temp_last->[3]{$temp_ends} += $temp_cur->[3]{$temp_ends};
 				}
-				$temp_last->[3] = \%temp_last_ends;
-				my %temp_last_polya_flag = %{$temp_last->[4]};
-				my %temp_cur_polya_flag = %{$temp_cur->[4]};
-				foreach my $temp_polya_flag (keys %temp_cur_polya_flag){
-					unless(exists $temp_last_polya_flag{$temp_polya_flag}){
-						$temp_last_polya_flag{$temp_polya_flag} = 0;
+				foreach my $temp_polya_flag (keys %{$temp_cur->[4]}){
+					unless(exists $temp_last->[4]{$temp_polya_flag}){
+						$temp_last->[4]{$temp_polya_flag} = 0;
 					}
-					$temp_last_polya_flag{$temp_polya_flag} += $temp_cur_polya_flag{$temp_polya_flag};
+					$temp_last->[4]{$temp_polya_flag} += $temp_cur->[4]{$temp_polya_flag};
 				}
-				$temp_last->[4] = \%temp_last_polya_flag;
 				@{$temp_cur} = ();
 			}
 			else{
@@ -1402,8 +1487,9 @@ sub find_nearest{
 
 #Perform exon-exon junction correction
 sub correct_eej{
-	my ($temp_loci_ref, $temp_ref_eej_array_ref, $temp_ref_eej_hash_ref, $temp_min_junc_dist, $temp_junc_dist_ref) = @_;
+	my ($temp_loci_ref, $temp_ref_eej_array_ref, $temp_ref_eej_hash_ref, $temp_min_junc_dist, $temp_junc_dist_ref, $temp_denovo) = @_;
 	my $temp_num_filtered_junc_dist = 0;
+	my $temp_num_denovo_dist = 0;
 	foreach my $temp_strand (keys %$temp_loci_ref){
 		#print "Strand:$temp_strand\n";
 		foreach my $temp_locus (@{$temp_loci_ref->{$temp_strand}}){
@@ -1418,39 +1504,55 @@ sub correct_eej{
 				my @temp_eej = split('-', $temp_eej);
 				#Shift to eliminate the empty value at the first position of the array
 				shift @temp_eej;
-				my @temp_nearest_splice_site;
 				my $temp_corrected_eej = "-";
 				my $temp_cur_leftmost = $temp_locus->[2]{$temp_eej}[0][0];
 				my $temp_cur_rightmost = $temp_locus->[2]{$temp_eej}[0][1];
+				my $temp_has_uncorrectable = 0;
 				foreach my $temp_splice_site (@temp_eej){
 					my @temp_splice_site = split(',', $temp_splice_site);
 					#print "\tComparing @temp_splice_site and @{$ref_eej_array_ref->{$current_chr}{$temp_strand}}\n";
 					my $temp_nearest_splice_site_ref = find_nearest(\@temp_splice_site, \@{$temp_ref_eej_array_ref->{$temp_strand}}, \%{$temp_ref_eej_hash_ref->{$temp_strand}}, $temp_strand, $temp_min_junc_dist, $temp_junc_dist_ref);
-					#Can correct one of the splice junction
-					if($temp_nearest_splice_site_ref){
-						#print "\tFound the nearest splice junction:@{$temp_nearest_splice_site_ref}\n";
-						#Valid splice junction
-						if(($temp_nearest_splice_site_ref->[0] >= $temp_cur_leftmost) && ($temp_nearest_splice_site_ref->[1] <= $temp_cur_rightmost)){
-							#Keep the valid junction
-							#print "\tThis is a valid splice junction.\n";
-							$temp_corrected_eej .= $temp_nearest_splice_site_ref->[0] . "," . $temp_nearest_splice_site_ref->[1] . "-";
-							$temp_cur_leftmost = $temp_nearest_splice_site_ref->[1];
-						}
-						#Invalid splice junction
-						else{
-							#print "\tThis is an invalid splice junction with depth $temp_loci->[2]{$temp_eej}[2]\n";
-							$temp_num_filtered_junc_dist += $temp_locus->[2]{$temp_eej}[0][2];
-							delete $temp_locus->[2]{$temp_eej};
-							next EEJ;
-						}
+					my $temp_use_ref = undef;
+					if($temp_nearest_splice_site_ref && ($temp_nearest_splice_site_ref->[0] >= $temp_cur_leftmost) && ($temp_nearest_splice_site_ref->[1] <= $temp_cur_rightmost)){
+						#Valid splice junction: find_nearest() found a near-enough reference junction,
+						#and applying it keeps this transcript's junctions in order and within its span.
+						#print "\tThis is a valid splice junction.\n";
+						$temp_use_ref = $temp_nearest_splice_site_ref;
 					}
-					#Cannot correct one of the splice junctions
+					elsif($temp_denovo && ($temp_splice_site[0] >= $temp_cur_leftmost) && ($temp_splice_site[1] <= $temp_cur_rightmost)){
+						#Uncorrectable (no near-enough reference junction at all, or the one found would
+						#violate this transcript's own junction ordering/bounds) -- in de novo mode, keep
+						#this junction exactly as originally sequenced instead of discarding the whole
+						#transcript: a reference junction set is never complete, and a consistently-
+						#supported novel junction shouldn't be thrown out just because it isn't yet
+						#annotated. Still re-checked against the same floor/ceiling as any other
+						#candidate, rather than assumed valid: a PRECEDING junction in this same chain
+						#may have just been corrected to a reference site whose acceptor sits a few bases
+						#past this junction's own original span (within the correction distance budget),
+						#which can -- only for a very short exon immediately downstream of a corrected
+						#junction -- push $temp_cur_leftmost past this junction's own original donor
+						#site. Falling through to the discard path below in that case is intentional: at
+						#that point neither the correction nor the original coordinates can be placed
+						#validly here, so there is no non-overlapping choice left to keep for this
+						#junction.
+						$temp_use_ref = \@temp_splice_site;
+						$temp_has_uncorrectable = 1;
+					}
+					if($temp_use_ref){
+						$temp_corrected_eej .= $temp_use_ref->[0] . "," . $temp_use_ref->[1] . "-";
+						$temp_cur_leftmost = $temp_use_ref->[1];
+					}
 					else{
+						#Cannot correct this splice junction, and either de novo mode is off or even this
+						#junction's own original coordinates no longer fit here -- discard the transcript.
 						#print "\tNot able to correct the splice junction with depth $temp_loci->[2]{$temp_eej}[2].\n";
 						$temp_num_filtered_junc_dist += $temp_locus->[2]{$temp_eej}[0][2];
 						delete $temp_locus->[2]{$temp_eej};
 						next EEJ;
 					}
+				}
+				if($temp_has_uncorrectable){
+					$temp_num_denovo_dist += $temp_locus->[2]{$temp_eej}[0][2];
 				}
 				#print "\tEEJ_after:$temp_corrected_eej\n";
 				if($temp_eej eq $temp_corrected_eej){
@@ -1475,7 +1577,7 @@ sub correct_eej{
 		}
 	}
 
-	return ($temp_num_filtered_junc_dist);
+	return ($temp_num_filtered_junc_dist, $temp_num_denovo_dist);
 }
 
 #Separate transcripts from loci after exon-exon junction correction
